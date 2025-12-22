@@ -34,8 +34,8 @@
 | Data Layer                  |      | Data Layer                  |
 | DEF_DATA_AGENT.DataAgent    |      | DEF_DATA_AGENT.DataAgent    |
 |  - IBKR Socket get_conid    |      |  - IBKR Socket get_conid    |
-|  - get_history → candles    |      |  - get_history → candles   |
-|  - market_meta.last_close   |      |  - market_meta.last_close  |
+|  - get_history → candles    |      |  - get_history → candles    |
+|  - market_meta.last_close   |      |  - market_meta.last_close   |
 +-----------------------------+      +-----------------------------+
        |                                    |
        v                                    v
