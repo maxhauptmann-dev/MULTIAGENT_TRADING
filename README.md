@@ -1,52 +1,102 @@
-# AI_TRADING – Hierarchisches Multi‑Agent‑Modell
+# AI_TRADING – Hierarchisches Multi-Agent-Modell
 
-```mermaid
-flowchart TD
-  A[Lead Agent<br/>(MAIN_USER_AGENT.start)] --> B{Modus}
-  B --> C[Einzelmodus<br/>(trading_agents_with_gpt.run_single_symbol_mode)]
-  B --> D[Scannermodus<br/>(DEF_SCANNER_MODE.run_scanner_mode)]
-
-  %% Scanner: Universen
-  A --> U[Universe Manager<br/>(universe_manager)]
-  U --> D
-
-  %% Data & News
-  C --> E[Data Layer<br/>DEF_DATA_AGENT.DataAgent.fetch()]
-  D --> E
-  E --> F[News Layer<br/>DEF_NEWS_CLIENT.NewsClient.get_combined_news()]
-
-  %% Analyse-Agents
-  F --> G[Analyse‑Agents (DEF_GPT_AGENTS)<br/>regime · trend_dow · sr_formations · momentum · volume_oi · candlestick · intermarket]
-  G --> H[Synthese‑Agent<br/>(synthese_agent)]
-  H --> I[Signal‑Scanner<br/>(signal_scanner_agent)]
-  I --> J[Handels‑Agent<br/>(handels_agent) → trade_plan]
-
-  %% Risk & Options
-  J --> K[Risk Management<br/>risk.compute_position_size()]
-  D --> CB[[CircuitBreaker<br/>(risk.CircuitBreaker)]]
-  J --> L[Options‑Plan<br/>DEF_OPTIONS_AGENT.build_options_plan()]
-
-  %% Execution
-  L --> M{auto_execute?}
-  M -- ja --> N[ExecutionAgent.execute_trade_plan()<br/>→ IBKR / OANDA / Alpaca / Tradier]
-  M -- nein --> O[Output (Plan/Analysen)]
-```
-
-## ASCII (Fallback)
+## Architekturübersicht
 
 ```text
-AI_TRADING
-├─ MAIN_USER_AGENT.start (Lead/Orchestrator)
-│  ├─ Einzelmodus → trading_agents_with_gpt.run_single_symbol_mode()
-│  └─ Scannermodus → DEF_SCANNER_MODE.run_scanner_mode()
-│     └─ Universe Manager → Watchlist (sp500, nasdaq100, semis, dax, commodities)
-│
-├─ Data Layer → DEF_DATA_AGENT.DataAgent.fetch() → candles, market_meta.last_close
-├─ News Layer → DEF_NEWS_CLIENT.NewsClient.get_combined_news()
-├─ Analyse‑Agents (DEF_GPT_AGENTS.call/safe_call)
-│  ├─ regime · trend_dow · sr_formations · momentum · volume_oi · candlestick · intermarket
-│  └─ Synthese → Signal → Handels‑Plan
-├─ Risk → risk.compute_position_size() ; Scanner: risk.CircuitBreaker
-├─ Options → DEF_OPTIONS_AGENT.build_options_plan()
-└─ Execution (optional) → ExecutionAgent.execute_trade_plan() → IBKR/OANDA/Alpaca/Tradier
-```
++--------------------------------------------------+
+| Lead Agent (MAIN_USER_AGENT.start)               |
+|  - Orchestrator / UI                             |
++--------------------------------------------------+
+                |
+     +-------------------------------+
+     |              Modes            |
+     +-------------------------------+
+       |                            |
+       |                            |
+       v                            v
++-------------------------------+   +--------------------------------+
+| Einzelmodus                   |   | Scannermodus                   |
+| run_single_symbol_mode()      |   | DEF_SCANNER_MODE.run_scanner_ |
+| (trading_agents_with_gpt)     |   | mode()                         |
++-------------------------------+   +--------------------------------+
+       |                                    |
+       |                                    |
+       |                                    +-----------------------------+
+       |                                    | Universe Manager            |
+       |                                    | load_universe / combine_    |
+       |                                    | universes → Watchlist       |
+       |                                    +-----------------------------+
+       |                                    |
+       |                           pro Symbol (parallel, safe_call_gpt)
+       |                                    |
+       v                                    v
++-----------------------------+      +-----------------------------+
+| Data Layer                  |      | Data Layer                  |
+| DEF_DATA_AGENT.DataAgent    |      | DEF_DATA_AGENT.DataAgent    |
+|  - IBKR Socket get_conid    |      |  - IBKR Socket get_conid    |
+|  - get_history → candles   |      |  - get_history → candles   |
+|  - market_meta.last_close  |      |  - market_meta.last_close  |
++-----------------------------+      +-----------------------------+
+       |                                    |
+       v                                    v
++-----------------------------+      +-----------------------------+
+| News Layer                  |      | News Layer                  |
+| DEF_NEWS_CLIENT.NewsClient  |      | DEF_NEWS_CLIENT.NewsClient  |
+|  - Finnhub + SerpAPI        |      |  - Finnhub + SerpAPI        |
+|  - get_combined_news()     |      |  - get_combined_news()     |
++-----------------------------+      +-----------------------------+
+       |                                    |
+       v                                    v
++---------------------------------------------------------------+
+| Analyse-Agents                                                |
+| (DEF_GPT_AGENTS / safe_call_gpt_agent)                        |
+|                                                               |
+|  - regime_agent                                               |
+|  - trend_dow_agent                                            |
+|  - sr_formations_agent                                        |
+|  - momentum_agent                                             |
+|  - volume_oi_agent                                            |
+|  - candlestick_agent                                          |
+|  - intermarket_agent                                          |
++---------------------------------------------------------------+
+       |
+       v
++-----------------------------+
+| Synthese                    |
+| synthese_agent → Marktbild  |
++-----------------------------+
+       |
+       v
++-----------------------------+
+| Signal Scanner              |
+| signal_scanner_agent        |
++-----------------------------+
+       |
+       v
++-----------------------------+
+| Handels-Plan                |
+| handels_agent → trade_plan  |
++-----------------------------+
+       |
+       | Sanity Checks & Sizing
+       v
++-----------------------------+
+| Risk Management             |
+| risk.compute_position_size  |
+|  - qty aus Stop-Distanz     |
++-----------------------------+
+       |
+       v
++-----------------------------+
+| Options-Plan                |
+| DEF_OPTIONS_AGENT           |
+| build_options_plan()        |
++-----------------------------+
+       |
+       v
++-----------------------------+
+| Execution (optional Paper)  |
+| ExecutionAgent.execute_     |
+| trade_plan() → IBKR / …     |
++-----------------------------+
+
