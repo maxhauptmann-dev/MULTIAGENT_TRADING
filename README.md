@@ -16,7 +16,7 @@
        v                            v
 +-------------------------------+   +--------------------------------+
 | Einzelmodus                   |   | Scannermodus                   |
-| run_single_symbol_mode()      |   | DEF_SCANNER_MODE.run_scanner_ |
+| run_single_symbol_mode()      |   | DEF_SCANNER_MODE.run_scanner_  |
 | (trading_agents_with_gpt)     |   | mode()                         |
 +-------------------------------+   +--------------------------------+
        |                                    |
@@ -34,8 +34,8 @@
 | Data Layer                  |      | Data Layer                  |
 | DEF_DATA_AGENT.DataAgent    |      | DEF_DATA_AGENT.DataAgent    |
 |  - IBKR Socket get_conid    |      |  - IBKR Socket get_conid    |
-|  - get_history → candles   |      |  - get_history → candles   |
-|  - market_meta.last_close  |      |  - market_meta.last_close  |
+|  - get_history → candles    |      |  - get_history → candles   |
+|  - market_meta.last_close   |      |  - market_meta.last_close  |
 +-----------------------------+      +-----------------------------+
        |                                    |
        v                                    v
@@ -43,7 +43,7 @@
 | News Layer                  |      | News Layer                  |
 | DEF_NEWS_CLIENT.NewsClient  |      | DEF_NEWS_CLIENT.NewsClient  |
 |  - Finnhub + SerpAPI        |      |  - Finnhub + SerpAPI        |
-|  - get_combined_news()     |      |  - get_combined_news()     |
+|  - get_combined_news()      |      |  - get_combined_news()      |
 +-----------------------------+      +-----------------------------+
        |                                    |
        v                                    v
