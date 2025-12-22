@@ -1,5 +1,13 @@
 # AI_TRADING – Hierarchisches Multi-Agent-Modell
 
+
+AI_TRADING
+
+Hierarchical Multi-Agent Trading System
+AI_TRADING is a signal-driven, hierarchical multi-agent framework for market analysis, trade planning, and (optional) execution.
+It combines market data, news, and multiple specialized AI agents to generate structured, risk-aware trade and options plans.
+The system is designed to mirror how a professional discretionary or systematic trader reasons — but in a modular, testable, and scalable architecture.
+
 ## Architekturübersicht
 
 ```text
@@ -99,4 +107,5 @@
 | ExecutionAgent.execute_     |
 | trade_plan() → IBKR / …     |
 +-----------------------------+
+```
 
