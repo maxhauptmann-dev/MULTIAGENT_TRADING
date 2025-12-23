@@ -4,9 +4,12 @@ import json
 import time
 import threading
 import concurrent.futures
-from openai import OpenAI
+try:
+  from openai import OpenAI  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+  OpenAI = None  # type: ignore[assignment]
 
-client = OpenAI()
+client = OpenAI() if OpenAI is not None else None
 
 # Prompts (Kurzfassungen). Passe bei Bedarf an deine Logik an.
 PROMPTS: Dict[str, str] = {
@@ -354,6 +357,12 @@ def call_gpt_agent(agent_name: str, payload: Dict[str, Any],
     """
     if agent_name not in PROMPTS:
         return {"error": "unknown_agent", "agent_name": agent_name}
+    if client is None:
+        return {
+            "error": "openai_missing",
+            "agent_name": agent_name,
+            "message": "openai package ist nicht installiert – `pip install openai`.",
+        }
 
     system_prompt = PROMPTS[agent_name]
     messages = [

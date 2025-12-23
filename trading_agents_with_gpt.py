@@ -21,19 +21,49 @@ Der User-Agent & Orchestrator sitzen typischerweise in deinem Chat-Flow (z. B. i
 und rufen die Python-Funktionen `run_single_symbol_mode` bzw. `run_scanner_mode` auf.
 """
 
+import logging
 import os
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 from DEF_OPTIONS_AGENT import OptionsAgent
 from DEF_NEWS_CLIENT import NewsClient
 from DEF_GPT_AGENTS import call_gpt_agent
-from DEF_DATA_AGENT import DataAgent  # IBKR Socket/History
+
+try:
+    from DEF_DATA_AGENT import DataAgent  # IBKR Socket/History
+except ImportError:  # pragma: no cover - optional dependency (requires ibapi)
+    DataAgent = None  # type: ignore[assignment]
 
 load_dotenv()
+
+
+def _as_bool(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_positive_float(value: Optional[str]) -> float:
+    try:
+        parsed = float(value) if value not in (None, "") else 0.0
+    except ValueError:
+        parsed = 0.0
+    return parsed if parsed > 0 else 0.0
+
+
+LOG_LEVEL = os.getenv("TRADING_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("ExecutionAgent")
+
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "simulate").strip().lower()
+PAPER_EXECUTE = _as_bool(os.getenv("PAPER_EXECUTE", "0"))
+MAX_QTY_CAP = _as_positive_float(os.getenv("MAX_QTY_CAP"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
+HTTP_RETRY_TOTAL = int(os.getenv("HTTP_RETRY_TOTAL", "3"))
 
 # ============================================================
 # 1. Broker-Config & HTTP-Utils
@@ -43,6 +73,7 @@ CONFIG = {
     "ibkr": {
         # IBKR Client Portal API / Gateway
         "base_url": os.getenv("IBKR_BASE_URL", "https://localhost:5000/v1/api"),
+        "account_id": os.getenv("IBKR_ACCOUNT_ID"),
     },
     "oanda": {
         "base_url": os.getenv("OANDA_BASE_URL", "https://api-fxtrade.oanda.com"),
@@ -71,13 +102,27 @@ def _assert_env(name: str, value: Optional[str]):
 # Warnung für self-signed Zertifikat unterdrücken (IBKR localhost)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# eine Session benutzen → Cookies bleiben erhalten
+# eine Session mit Retries benutzen → Cookies + resilient HTTP
 session = requests.Session()
+retry_strategy = Retry(
+    total=HTTP_RETRY_TOTAL,
+    backoff_factor=0.4,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+session.headers.update({"User-Agent": "ExecutionAgent/1.0", "Accept": "application/json"})
 
 
 def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> Any:
-    resp = session.get(url, headers=headers or {}, verify=False)
-    print(f"[HTTP GET] {url} -> {resp.status_code}")
+    try:
+        resp = session.get(url, headers=headers or {}, timeout=HTTP_TIMEOUT, verify=False)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"GET {url} failed: {exc}") from exc
+
+    logger.debug("[HTTP GET] %s -> %s", url, resp.status_code)
     if resp.status_code == 401:
         raise RuntimeError(
             f"IBKR: 401 Unauthorized für {url} – Session ist für diese Anfrage noch nicht authentifiziert."
@@ -88,15 +133,27 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> Any:
 
 
 def http_post(url: str, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
-    resp = session.post(url, json=body, headers=headers or {}, verify=False)
-    print(f"[HTTP POST] {url} -> {resp.status_code}")
+    try:
+        resp = session.post(
+            url,
+            json=body,
+            headers=headers or {},
+            timeout=HTTP_TIMEOUT,
+            verify=False,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"POST {url} failed: {exc}") from exc
+
+    logger.debug("[HTTP POST] %s -> %s", url, resp.status_code)
     if resp.status_code == 401:
         raise RuntimeError(
             f"IBKR: 401 Unauthorized für {url} – Session ist für diese Anfrage noch nicht authentifiziert."
         )
     if not resp.ok:
         raise RuntimeError(f"POST {url} failed: {resp.status_code} {resp.text}")
-    return resp.json()
+    if resp.text:
+        return resp.json()
+    return {}
 
 
 # ============================================================
@@ -104,28 +161,144 @@ def http_post(url: str, body: Dict[str, Any], headers: Optional[Dict[str, str]] 
 # ============================================================
 
 class ExecutionAgent:
+    """Routes trade plans to the selected broker with guardrails and logging."""
+
+    def __init__(self) -> None:
+        self.mode = EXECUTION_MODE
+        self.paper_guard = PAPER_EXECUTE
+        self.max_qty_cap = MAX_QTY_CAP if MAX_QTY_CAP > 0 else None
+        self.ibkr_conid_cache: Dict[str, int] = {}
+        self.ibkr_account_id = CONFIG["ibkr"].get("account_id")
+
+    # ---------- internal helpers ----------
+    def _should_simulate(self, broker: Optional[str]) -> bool:
+        return self.mode == "simulate" or (broker or "").lower() == "simulate"
+
+    def _ensure_paper_guard(self) -> None:
+        if self.mode in {"paper", "live"} and not self.paper_guard:
+            raise RuntimeError(
+                "Ausführung blockiert: PAPER_EXECUTE=1 erforderlich, um Paper/Live Orders zu senden."
+            )
+
+    def _cap_quantity(self, qty: float) -> Tuple[float, Dict[str, Any]]:
+        info: Dict[str, Any] = {}
+        if self.max_qty_cap is not None and qty > self.max_qty_cap:
+            info = {"capped": True, "requested_qty": qty, "used_qty": self.max_qty_cap}
+            logger.warning("Qty %s über MAX_QTY_CAP %s – capped.", qty, self.max_qty_cap)
+            return float(self.max_qty_cap), info
+        return qty, info
+
+    def _validate_trade_plan(self, trade_plan: Dict[str, Any]) -> Dict[str, Any]:
+        if not trade_plan:
+            raise ValueError("trade_plan fehlt")
+        if trade_plan.get("action") != "open_position":
+            raise ValueError("trade_plan verlangt keine offene Position")
+        if not trade_plan.get("symbol"):
+            raise ValueError("Symbol fehlt im trade_plan")
+        sizing = trade_plan.get("position_sizing") or {}
+        qty = float(sizing.get("contracts_or_shares") or 0)
+        if qty <= 0:
+            raise ValueError("Positionsgröße <= 0")
+        return {"qty": qty, "sizing": sizing}
+
+    def _determine_side(self, direction: Optional[str]) -> str:
+        return "SELL" if (direction or "").lower() == "short" else "BUY"
+
+    def _ensure_ibkr_account(self) -> str:
+        if self.ibkr_account_id:
+            return self.ibkr_account_id
+        base = CONFIG["ibkr"]["base_url"]
+        data = http_get(f"{base}/iserver/accounts")
+        accounts = data.get("accounts") if isinstance(data, dict) else data
+        if not accounts:
+            raise RuntimeError("IBKR liefert keine Accounts zurück – Client Portal Session aktiv?")
+        if isinstance(accounts, list):
+            self.ibkr_account_id = accounts[0]
+        elif isinstance(accounts, dict) and accounts.get("accounts"):
+            self.ibkr_account_id = accounts["accounts"][0]
+        else:
+            raise RuntimeError("IBKR Accounts Response unbekanntes Format")
+        return self.ibkr_account_id
+
+    def _ibkr_sec_type(self, instrument_type: str) -> str:
+        mapping = {
+            "stock": "STK",
+            "equity": "STK",
+            "option": "OPT",
+            "options": "OPT",
+            "future": "FUT",
+            "fx": "CASH",
+            "forex": "CASH",
+        }
+        return mapping.get((instrument_type or "stock").lower(), "STK")
+
+    def _ibkr_conid(self, symbol: str, instrument_type: str) -> int:
+        cache_key = f"{symbol}_{instrument_type}"
+        if cache_key in self.ibkr_conid_cache:
+            return self.ibkr_conid_cache[cache_key]
+        base = CONFIG["ibkr"]["base_url"]
+        body = {
+            "symbol": symbol,
+            "name": False,
+            "secType": self._ibkr_sec_type(instrument_type),
+            "exchange": "SMART",
+        }
+        results = http_post(f"{base}/iserver/secdef/search", body)
+        if not results:
+            raise RuntimeError(f"IBKR: kein secdef Ergebnis für {symbol}")
+        first = results[0]
+        conid = int(first.get("conid") or first.get("conidex"))
+        self.ibkr_conid_cache[cache_key] = conid
+        return conid
+
+    def _ibkr_buying_power(self, account_id: str) -> Optional[float]:
+        base = CONFIG["ibkr"]["base_url"]
+        try:
+            summary = http_get(f"{base}/iserver/account/{account_id}/summary")
+            for item in summary.get("accountSummary", []):
+                if item.get("tag") == "BuyingPower":
+                    return float(item.get("value"))
+        except Exception as exc:
+            logger.warning("IBKR Buying Power Check fehlgeschlagen: %s", exc)
+        return None
+
+    # ---------- broker calls ----------
     def place_ibkr_order(
         self,
         symbol: str,
         side: str,
         quantity: float,
+        instrument_type: str,
         order_type: str = "MKT",
         limit_price: Optional[float] = None,
     ) -> Any:
+        account_id = self._ensure_ibkr_account()
+        buying_power = self._ibkr_buying_power(account_id)
+        if buying_power is not None and limit_price is not None:
+            est_cost = float(quantity) * float(limit_price)
+            if est_cost > buying_power:
+                raise RuntimeError(
+                    f"IBKR Buying Power ({buying_power}) reicht nicht für Order ({est_cost})."
+                )
+
         base = CONFIG["ibkr"]["base_url"]
-        url = f"{base}/iserver/account/orders"
+        conid = self._ibkr_conid(symbol, instrument_type)
         body = {
             "orders": [
                 {
-                    "symbol": symbol,
-                    "side": side,             # "BUY" / "SELL"
-                    "orderType": order_type,  # "MKT", "LMT", ...
+                    "account": account_id,
+                    "conid": conid,
+                    "orderType": order_type,
+                    "side": side.lower(),
+                    "tif": "DAY",
                     "quantity": quantity,
-                    "lmtPrice": limit_price,
+                    "outsideRTH": False,
                 }
             ]
         }
-        return http_post(url, body)
+        if order_type in {"LMT", "LIMIT"} and limit_price is not None:
+            body["orders"][0]["price"] = limit_price
+        return http_post(f"{base}/iserver/account/{account_id}/orders", body)
 
     def place_oanda_order(self, symbol: str, side: str, units: float) -> Any:
         api_key = CONFIG["oanda"]["api_key"]
@@ -168,7 +341,7 @@ class ExecutionAgent:
             "qty": qty,
             "time_in_force": "day",
         }
-        if order_type == "limit" and limit_price is not None:
+        if order_type in {"limit", "stop_limit"} and limit_price is not None:
             body["limit_price"] = limit_price
 
         return http_post(
@@ -203,7 +376,7 @@ class ExecutionAgent:
             "type": order_type.lower(),
             "duration": "day",
         }
-        if order_type == "limit" and limit_price is not None:
+        if order_type.lower() == "limit" and limit_price is not None:
             body["price"] = limit_price
 
         return http_post(
@@ -215,42 +388,82 @@ class ExecutionAgent:
             },
         )
 
+    def simulate_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MKT",
+        limit_price: Optional[float] = None,
+        broker: str = "simulated",
+    ) -> Dict[str, Any]:
+        receipt = {
+            "status": "simulated",
+            "broker": broker,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "order_type": order_type,
+            "limit_price": limit_price,
+            "mock_fill_price": limit_price,
+            "message": "Simulationsmodus – kein Broker-Call durchgeführt.",
+        }
+        logger.info("[ExecutionAgent] %s", receipt)
+        return receipt
+
+    # ---------- public API ----------
     def execute_trade_plan(
         self,
         trade_plan: Dict[str, Any],
         broker_preference: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not trade_plan or trade_plan.get("action") != "open_position":
-            return {"status": "no_trade", "reason": "Keine offene Position laut trade_plan."}
+        try:
+            validation = self._validate_trade_plan(trade_plan)
+        except ValueError as exc:
+            return {"status": "no_trade", "reason": str(exc)}
 
         symbol = trade_plan.get("symbol")
+        instrument_type = (trade_plan.get("instrument_type") or "stock").lower()
         direction = trade_plan.get("direction") or "long"
-        instrument_type = trade_plan.get("instrument_type") or "stock"
-        sizing = trade_plan.get("position_sizing") or {}
-        qty = sizing.get("contracts_or_shares", 0)
+        side = self._determine_side(direction)
+        qty = validation["qty"]
+        order_type = (trade_plan.get("order_type") or "MKT").upper()
+        limit_price = trade_plan.get("limit_price")
 
-        if not symbol or qty <= 0:
-            return {"status": "error", "reason": "Symbol oder Positionsgröße fehlt."}
+        preferred = (broker_preference or trade_plan.get("broker")) or "ibkr"
+        preferred = preferred.lower()
 
-        side = "SELL" if direction == "short" else "BUY"
+        if self._should_simulate(preferred):
+            receipt = self.simulate_order(symbol, side, qty, order_type, limit_price, broker="simulated")
+            return {"status": "simulated", "broker": "simulated", "raw": receipt}
 
-        # Routing: FX → OANDA
-        if instrument_type == "fx":
-            res = self.place_oanda_order(symbol, side, qty)
-            return {"status": "sent", "broker": "oanda", "raw": res}
+        try:
+            self._ensure_paper_guard()
+        except RuntimeError as exc:
+            return {"status": "blocked", "reason": str(exc)}
 
-        # US-Optionen → Alpaca / Tradier (wenn gewünscht)
-        if broker_preference == "alpaca":
-            res = self.place_alpaca_order(symbol, side, qty)
-            return {"status": "sent", "broker": "alpaca", "raw": res}
+        qty, cap_info = self._cap_quantity(qty)
+        if cap_info:
+            validation["sizing"].update(cap_info)
 
-        if broker_preference == "tradier":
-            res = self.place_tradier_order(symbol, side, qty)
-            return {"status": "sent", "broker": "tradier", "raw": res}
+        try:
+            if instrument_type in {"fx", "forex"}:
+                res = self.place_oanda_order(symbol, side, qty)
+                return {"status": "sent", "broker": "oanda", "raw": res}
 
-        # Default: IBKR
-        res = self.place_ibkr_order(symbol, side, qty)
-        return {"status": "sent", "broker": "ibkr", "raw": res}
+            if preferred == "alpaca":
+                res = self.place_alpaca_order(symbol, side, qty, order_type.lower(), limit_price)
+                return {"status": "sent", "broker": "alpaca", "raw": res}
+
+            if preferred == "tradier":
+                res = self.place_tradier_order(symbol, side, qty, order_type.lower(), limit_price)
+                return {"status": "sent", "broker": "tradier", "raw": res}
+
+            res = self.place_ibkr_order(symbol, side, qty, instrument_type, order_type, limit_price)
+            return {"status": "sent", "broker": "ibkr", "raw": res}
+        except Exception as exc:
+            logger.exception("Execution Fehler: %s", exc)
+            return {"status": "error", "reason": str(exc)}
 
 
 # ============================================================
@@ -286,9 +499,16 @@ def _map_timeframe_to_ibkr(timeframe: str) -> Tuple[str, int]:
 # ============================================================
 
 _news_client = NewsClient()
-_data_agent = DataAgent()
-_execution_agent = ExecutionAgent()
 _options_agent = OptionsAgent()
+_execution_agent = ExecutionAgent()
+
+if DataAgent is not None:
+    _data_agent = DataAgent()
+else:
+    _data_agent = None
+    logger.warning(
+        "DataAgent/ibapi nicht verfügbar – run_single_symbol_mode wird ohne Marktdaten nicht funktionieren."
+    )
 
 
 def run_single_symbol_mode(
@@ -308,6 +528,11 @@ def run_single_symbol_mode(
     5. Handels-Agent: Trade-Plan.
     6. Optional: Execution-Agent → Order-API.
     """
+
+    if _data_agent is None:
+        raise RuntimeError(
+            "DataAgent ist nicht verfügbar (ibapi fehlt). Bitte `pip install ibapi` und DEF_DATA_AGENT aktivieren."
+        )
 
     # Timeframe → IBKR-Param (bar_size + days)
     bar_size, days = _map_timeframe_to_ibkr(timeframe)
