@@ -109,3 +109,43 @@ The system is designed to mirror how a professional discretionary or systematic 
 +-----------------------------+
 ```
 
+## ExecutionAgent & Broker Safety
+
+The ExecutionAgent now mirrors production rails: it validates each trade plan, enforces quantity caps, performs broker-specific pre-flight checks (IBKR conid lookup + buying-power guard, OANDA/Alpaca/Tradier API assertions), and falls back to a structured simulator when `EXECUTION_MODE=simulate` or the broker preference is `simulate`.
+
+### Required environment
+
+Copy `.env.sample` → `.env` and fill in your own secrets (never commit `.env`):
+
+| Variable | Purpose |
+| --- | --- |
+| `EXECUTION_MODE` | `simulate` (default), `paper`, or `live`. |
+| `PAPER_EXECUTE` | Must be `1` to allow paper/live execution. Acts as a safety switch. |
+| `MAX_QTY_CAP` | Absolute position-size clamp enforced before routing. |
+| `IBKR_BASE_URL`, `IBKR_ACCOUNT_ID` | Client Portal / Gateway endpoint + paper account id. |
+| `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` | Practice credentials for FX orders. |
+| `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` | Alpaca paper keys (equities / options). |
+| `TRADIER_API_KEY`, `TRADIER_ACCOUNT_ID` | Tradier sandbox keys. |
+
+> ⚠️ Replace placeholders in `.env` with your own **secret** keys locally. Rotate any keys that were ever checked into git.
+
+### Optional dependencies
+
+- `pip install openai` is required when you actually call the GPT agents. Without it, the helpers stay importable but return an `openai_missing` error object.
+- `pip install ibapi` is required for the IBKR `DataAgent`. When it is missing you can still run the ExecutionAgent + simulate tests, but `run_single_symbol_mode` will raise a helpful error instead of silently failing.
+
+### Smoke test (simulation)
+
+```bash
+python TEST_EXECUTE_SIMULATE.py
+```
+
+The script forces `EXECUTION_MODE=simulate`, exercises quantity capping, and asserts that every result is either `simulated`, `blocked`, `sent`, or `no_trade`.
+
+### Paper / Live steps
+
+1. Start IBKR Client Portal API (paper) or equivalent broker sandbox.
+2. Set `EXECUTION_MODE=paper` and `PAPER_EXECUTE=1` in a local shell.
+3. Re-run `TEST_EXECUTE_SIMULATE.py` (should now block if PAPER_EXECUTE unset, otherwise attempt to hit the broker).
+4. Use `trading_agents_with_gpt.run_single_symbol_mode(..., auto_execute=True)` to route real trade plans once confident.
+
