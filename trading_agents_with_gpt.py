@@ -32,8 +32,13 @@ from DEF_OPTIONS_AGENT import OptionsAgent
 from DEF_NEWS_CLIENT import NewsClient
 from DEF_GPT_AGENTS import call_gpt_agent
 from DEF_DATA_AGENT import DataAgent  # IBKR Socket/History
+from risk import compute_position_size
 
 load_dotenv()
+
+# Execution-Schutz
+PAPER_EXECUTE = os.getenv("PAPER_EXECUTE", "0").lower() in {"1", "true", "yes"}
+MAX_QTY_CAP = int(os.getenv("MAX_QTY_CAP", "0") or 0)
 
 # ============================================================
 # 1. Broker-Config & HTTP-Utils
@@ -223,11 +228,24 @@ class ExecutionAgent:
         if not trade_plan or trade_plan.get("action") != "open_position":
             return {"status": "no_trade", "reason": "Keine offene Position laut trade_plan."}
 
+        if not PAPER_EXECUTE:
+            return {
+                "status": "blocked",
+                "reason": "PAPER_EXECUTE ist nicht gesetzt – Ausführung gesperrt.",
+            }
+
         symbol = trade_plan.get("symbol")
         direction = trade_plan.get("direction") or "long"
         instrument_type = trade_plan.get("instrument_type") or "stock"
         sizing = trade_plan.get("position_sizing") or {}
         qty = sizing.get("contracts_or_shares", 0)
+
+        original_qty = qty
+        if MAX_QTY_CAP > 0 and qty > MAX_QTY_CAP:
+            qty = MAX_QTY_CAP
+            sizing["capped"] = True
+            sizing["requested_qty"] = original_qty
+            sizing["used_qty"] = qty
 
         if not symbol or qty <= 0:
             return {"status": "error", "reason": "Symbol oder Positionsgröße fehlt."}
@@ -289,6 +307,86 @@ _news_client = NewsClient()
 _data_agent = DataAgent()
 _execution_agent = ExecutionAgent()
 _options_agent = OptionsAgent()
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def _validate_and_size_trade_plan(
+    trade_plan: Dict[str, Any],
+    account_info: Dict[str, Any],
+    market_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(trade_plan, dict):
+        return trade_plan
+
+    last_close = _safe_float((market_meta or {}).get("last_close"))
+    entry_price = _safe_float((trade_plan.get("entry") or {}).get("trigger_price"))
+    stop_price = _safe_float((trade_plan.get("stop_loss") or {}).get("price"))
+    direction = (trade_plan.get("direction") or "long").lower()
+
+    flags = []
+    action = trade_plan.get("action")
+
+    if last_close is None:
+        flags.append("last_close_missing")
+    if entry_price is None:
+        flags.append("entry_missing")
+    if stop_price is None:
+        flags.append("stop_missing")
+
+    if flags:
+        trade_plan["sanity_flags"] = flags
+        trade_plan["action"] = "no_trade"
+        trade_plan["sanity_reason"] = "Preis-Informationen fehlen (entry/stop/last_close)."
+        return trade_plan
+
+    # Entry vs. Marktpreis sanity: ±5%
+    entry_deviation = abs(entry_price - last_close) / max(last_close, 1e-9)
+    if entry_deviation > 0.05:
+        flags.append("entry_far_from_last_close")
+
+    # Stop-Distanz sanity: < 15% vom Marktpreis
+    stop_dist_pct = abs(entry_price - stop_price) / max(last_close, 1e-9)
+    if stop_dist_pct > 0.15:
+        flags.append("stop_too_far")
+
+    # Richtungskonsistenz
+    if direction == "long" and stop_price >= entry_price:
+        flags.append("stop_not_below_entry_for_long")
+    if direction == "short" and stop_price <= entry_price:
+        flags.append("stop_not_above_entry_for_short")
+
+    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        flags.append("invalid_risk_per_share")
+
+    if flags:
+        trade_plan["sanity_flags"] = flags
+        trade_plan["action"] = "no_trade"
+        trade_plan["sanity_reason"] = ", ".join(flags)
+        return trade_plan
+
+    # Positionsgröße konservativ berechnen
+    size_info = compute_position_size(
+        account_size=account_info.get("account_size", 0),
+        max_risk_per_trade=account_info.get("max_risk_per_trade", 0),
+        entry_price=entry_price,
+        stop_price=stop_price,
+    )
+
+    trade_plan["position_sizing"] = {
+        "max_risk_amount": size_info.get("max_risk_amount"),
+        "risk_per_share": size_info.get("risk_per_share"),
+        "contracts_or_shares": size_info.get("qty", 0),
+    }
+
+    trade_plan["sanity_flags"] = flags
+    return trade_plan
 
 
 def run_single_symbol_mode(
@@ -393,6 +491,9 @@ def run_single_symbol_mode(
         "market_meta": market_meta,
     }
     trade_plan = call_gpt_agent("handels_agent", handels_input)
+
+    # Sanity-Checks + konservative Positionsgröße
+    trade_plan = _validate_and_size_trade_plan(trade_plan, account_info, market_meta)
 
     # Options-Plan (analytisch)
     options_plan = None

@@ -1,6 +1,5 @@
 # MAIN_USER_AGENT.py
-
-from trading_agents_with_gpt import run_single_symbol_mode
+from trading_agents_with_gpt import run_single_symbol_mode, ExecutionAgent, PAPER_EXECUTE
 from DEF_SCANNER_MODE import run_scanner_mode
 from universe_manager import manager as universe_manager
 
@@ -33,6 +32,10 @@ def format_single_result(result):
     # --------------------------------------
     if action != "open_position":
         print("Es wird KEINE Position eröffnet (no_trade).")
+
+        sanity_reason = plan.get("sanity_reason")
+        if sanity_reason:
+            print(f"Sanity-Check: {sanity_reason}")
 
         print("\nWichtige Gründe:")
         for r in synth.get("key_reasons", [])[:5]:
@@ -110,6 +113,13 @@ def format_single_result(result):
     print(f"  Max Risk:      {size.get('max_risk_amount')}")
     print(f"  Größe:         {size.get('contracts_or_shares')}\n")
 
+    sanity_flags = plan.get("sanity_flags") or []
+    if sanity_flags:
+        print(f"Sanity-Flags:   {', '.join(sanity_flags)}")
+    sanity_reason = plan.get("sanity_reason")
+    if sanity_reason:
+        print(f"Sanity-Check:   {sanity_reason}")
+
     print("Wichtige Gründe:")
     for r in synth.get("key_reasons", [])[:5]:
         print(" -", r)
@@ -165,6 +175,10 @@ def format_scanner_results(result):
         print(f"    Signal:        {signal.get('short_term_signal')}  (Conf: {signal.get('confidence')})")
         print(f"    Entry-Stil:    {signal.get('entry_style')}")
         print(f"    News-Sentiment: {nsent_str}")
+
+        sanity_flags = plan.get("sanity_flags") or []
+        if sanity_flags:
+            print(f"    Sanity-Flags:  {', '.join(sanity_flags)}")
 
         reason = plan.get("reason", "")
         if isinstance(reason, str) and reason.strip():
@@ -235,6 +249,18 @@ def start():
             auto_execute=False,
         )
         format_single_result(result)
+
+        plan = (result or {}).get("trade_plan") or {}
+        if plan.get("action") == "open_position" and PAPER_EXECUTE:
+            confirm = input("Trade als PAPER_EXECUTE senden? (y/N): ").strip().lower()
+            if confirm in {"y", "yes"}:
+                exec_agent = ExecutionAgent()
+                exec_res = exec_agent.execute_trade_plan(plan, account_info.get("broker_preference"))
+                print(f"Execution Result: {exec_res}")
+            else:
+                print("Keine Ausführung gesendet.")
+        elif plan.get("action") == "open_position" and not PAPER_EXECUTE:
+            print("PAPER_EXECUTE ist nicht gesetzt – Ausführung bleibt gesperrt.")
 
     # ---------------------------------------------------------
     # 2) SCANNERMODUS – UNIVERSEN

@@ -1,3 +1,4 @@
+import os
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
@@ -6,7 +7,10 @@ from ibapi.ticktype import *
 
 import threading
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 # ============================================================
@@ -61,13 +65,13 @@ class IBKRClient(EWrapper, EClient):
 # ============================================================
 
 class IBKRApi:
-    def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 7):
+    def __init__(self, host: str = None, port: int = None, client_id: int = 7):
         """
         host/port: TWS oder IBKR Gateway
         client_id: eine beliebige Zahl, die noch nicht verwendet wird
         """
-        self.host = host
-        self.port = port
+        self.host = host or os.getenv("IBKR_SOCKET_HOST", "127.0.0.1")
+        self.port = int(port or os.getenv("IBKR_SOCKET_PORT", 7497))
         self.client_id = client_id
 
     def _run_loop(self, app: IBKRClient):
@@ -209,7 +213,7 @@ class DataAgent:
     def __init__(self, ibkr_api: Optional[IBKRApi] = None):
         self.api = ibkr_api or IBKRApi()
 
-    def _map_timeframe_to_bar_size(self, timeframe: str) -> (str, int):
+    def _map_timeframe_to_bar_size(self, timeframe: str) -> Tuple[str, int]:
         """
         Mappt dein timeframe (z.B. "1D", "1H", "15m") auf IBKR bar_size + geeignete Dauer in Tagen.
         """
