@@ -24,6 +24,7 @@ und rufen die Python-Funktionen `run_single_symbol_mode` bzw. `run_scanner_mode`
 import logging
 import os
 from typing import Dict, Any, List, Optional, Tuple
+from functools import partial
 
 import requests
 import urllib3
@@ -33,7 +34,12 @@ from dotenv import load_dotenv
 
 from DEF_OPTIONS_AGENT import OptionsAgent
 from DEF_NEWS_CLIENT import NewsClient
-from DEF_GPT_AGENTS import call_gpt_agent
+from DEF_GPT_AGENTS import safe_call_gpt_agent, run_calls_parallel
+from DEF_INDICATORS import compute_indicators, calculate_symbol_correlation
+from risk import compute_adaptive_kelly_size, PortfolioMetrics
+import position_monitor as _pm_module
+import sqlite3
+from datetime import datetime, timezone
 
 try:
     from DEF_DATA_AGENT import DataAgent  # IBKR Socket/History
@@ -72,7 +78,7 @@ HTTP_RETRY_TOTAL = int(os.getenv("HTTP_RETRY_TOTAL", "3"))
 CONFIG = {
     "ibkr": {
         # IBKR Client Portal API / Gateway
-        "base_url": os.getenv("IBKR_BASE_URL", "https://localhost:5000/v1/api"),
+        "base_url": os.getenv("IBKR_BASE_URL", "https://localhost:5003/v1/api"),
         "account_id": os.getenv("IBKR_ACCOUNT_ID"),
     },
     "oanda": {
@@ -156,19 +162,26 @@ def http_post(url: str, body: Dict[str, Any], headers: Optional[Dict[str, str]] 
     return {}
 
 
+
 # ============================================================
 # 3. ExecutionAgent – Broker-Orders
 # ============================================================
-
 class ExecutionAgent:
     """Routes trade plans to the selected broker with guardrails and logging."""
 
     def __init__(self) -> None:
-        self.mode = EXECUTION_MODE
-        self.paper_guard = PAPER_EXECUTE
-        self.max_qty_cap = MAX_QTY_CAP if MAX_QTY_CAP > 0 else None
+        # Read runtime environment at instantiation time so tests can change os.environ
+        # Betriebsmodus: "simulate" (default), "paper", "live"
+        self.mode = os.getenv("EXECUTION_MODE", "simulate").strip().lower()
+        # PAPER_EXECUTE muss gesetzt sein, um paper/live Ausführung zu erlauben
+        self.paper_guard = _as_bool(os.getenv("PAPER_EXECUTE", "0"))
+        # Max qty cap (None = kein Cap)
+        max_qty = _as_positive_float(os.getenv("MAX_QTY_CAP", None))
+        self.max_qty_cap = max_qty if max_qty > 0 else None
         self.ibkr_conid_cache: Dict[str, int] = {}
         self.ibkr_account_id = CONFIG["ibkr"].get("account_id")
+        # Instance logger
+        self.logger = logger
 
     # ---------- internal helpers ----------
     def _should_simulate(self, broker: Optional[str]) -> bool:
@@ -191,12 +204,15 @@ class ExecutionAgent:
     def _validate_trade_plan(self, trade_plan: Dict[str, Any]) -> Dict[str, Any]:
         if not trade_plan:
             raise ValueError("trade_plan fehlt")
-        if trade_plan.get("action") != "open_position":
-            raise ValueError("trade_plan verlangt keine offene Position")
+        if trade_plan.get("action") not in {"open_position", "close_position"}:
+            raise ValueError("trade_plan verlangt keine offene/geschlossene Position")
         if not trade_plan.get("symbol"):
             raise ValueError("Symbol fehlt im trade_plan")
         sizing = trade_plan.get("position_sizing") or {}
-        qty = float(sizing.get("contracts_or_shares") or 0)
+        try:
+            qty = float(sizing.get("contracts_or_shares") or 0)
+        except Exception:
+            qty = 0.0
         if qty <= 0:
             raise ValueError("Positionsgröße <= 0")
         return {"qty": qty, "sizing": sizing}
@@ -204,6 +220,7 @@ class ExecutionAgent:
     def _determine_side(self, direction: Optional[str]) -> str:
         return "SELL" if (direction or "").lower() == "short" else "BUY"
 
+    # ---------- IBKR helpers ----------
     def _ensure_ibkr_account(self) -> str:
         if self.ibkr_account_id:
             return self.ibkr_account_id
@@ -263,6 +280,23 @@ class ExecutionAgent:
         return None
 
     # ---------- broker calls ----------
+    def _place_ibkr_socket_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MKT",
+        limit_price: Optional[float] = None,
+    ) -> Any:
+        """Order über TWS Socket API (ibapi, Port 7497) — kein Client Portal nötig."""
+        from DEF_DATA_AGENT import IBKRApi
+        api = IBKRApi(
+            host=os.getenv("IBKR_SOCKET_HOST", "127.0.0.1"),
+            port=int(os.getenv("IBKR_SOCKET_PORT", "7497")),
+            client_id=8,
+        )
+        return api.place_order(symbol, side, float(quantity), order_type, limit_price)
+
     def place_ibkr_order(
         self,
         symbol: str,
@@ -272,33 +306,43 @@ class ExecutionAgent:
         order_type: str = "MKT",
         limit_price: Optional[float] = None,
     ) -> Any:
-        account_id = self._ensure_ibkr_account()
-        buying_power = self._ibkr_buying_power(account_id)
-        if buying_power is not None and limit_price is not None:
-            est_cost = float(quantity) * float(limit_price)
-            if est_cost > buying_power:
-                raise RuntimeError(
-                    f"IBKR Buying Power ({buying_power}) reicht nicht für Order ({est_cost})."
-                )
+        # Client Portal (REST) versuchen, bei Fehler auf TWS Socket fallback
+        try:
+            account_id = self._ensure_ibkr_account()
+            buying_power = self._ibkr_buying_power(account_id)
+            if buying_power is not None and limit_price is not None:
+                est_cost = float(quantity) * float(limit_price)
+                if est_cost > buying_power:
+                    raise RuntimeError(
+                        f"IBKR Buying Power ({buying_power}) reicht nicht für Order ({est_cost})."
+                    )
 
-        base = CONFIG["ibkr"]["base_url"]
-        conid = self._ibkr_conid(symbol, instrument_type)
-        body = {
-            "orders": [
-                {
-                    "account": account_id,
-                    "conid": conid,
-                    "orderType": order_type,
-                    "side": side.lower(),
-                    "tif": "DAY",
-                    "quantity": quantity,
-                    "outsideRTH": False,
-                }
-            ]
-        }
-        if order_type in {"LMT", "LIMIT"} and limit_price is not None:
-            body["orders"][0]["price"] = limit_price
-        return http_post(f"{base}/iserver/account/{account_id}/orders", body)
+            base = CONFIG["ibkr"]["base_url"]
+            conid = self._ibkr_conid(symbol, instrument_type)
+            body = {
+                "orders": [
+                    {
+                        "account": account_id,
+                        "conid": conid,
+                        "orderType": order_type,
+                        "side": side.lower(),
+                        "tif": "DAY",
+                        "quantity": quantity,
+                        "outsideRTH": False,
+                    }
+                ]
+            }
+            if order_type in {"LMT", "LIMIT"} and limit_price is not None:
+                body["orders"][0]["price"] = limit_price
+            return http_post(f"{base}/iserver/account/{account_id}/orders", body)
+
+        except Exception as exc:
+            logger.warning(
+                "[ExecutionAgent] Client Portal nicht erreichbar (%s) – "
+                "verwende TWS Socket (Port %s).",
+                exc, os.getenv("IBKR_SOCKET_PORT", "7497"),
+            )
+            return self._place_ibkr_socket_order(symbol, side, quantity, order_type, limit_price)
 
     def place_oanda_order(self, symbol: str, side: str, units: float) -> Any:
         api_key = CONFIG["oanda"]["api_key"]
@@ -412,6 +456,72 @@ class ExecutionAgent:
         return receipt
 
     # ---------- public API ----------
+    def _check_portfolio_drawdown(self, portfolio_equity: float = 100000.0) -> Dict[str, Any]:
+        """Check portfolio drawdown status. Returns {allow_new_trades, status, ...}"""
+        pm = PortfolioMetrics()
+        return pm.update_equity(portfolio_equity)
+
+    def _check_correlation_with_positions(self, symbol: str, db_path: str = "positions.db") -> Dict[str, Any]:
+        """
+        Check correlation of candidate symbol with open positions.
+        Returns {action: ACCEPT|REJECT|REDUCE_SIZE, max_correlation, details}
+        """
+        try:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            open_pos = conn.execute("SELECT symbol FROM positions WHERE status='open'").fetchall()
+            conn.close()
+        except Exception:
+            return {"action": "ACCEPT", "reason": "DB error, allowing trade"}
+
+        if not open_pos:
+            return {"action": "ACCEPT", "reason": "No open positions", "max_correlation": 0.0}
+
+        max_corr = 0.0
+        most_correlated = None
+
+        for row in open_pos:
+            open_symbol = row[0]
+            if open_symbol == symbol:
+                continue
+            corr = calculate_symbol_correlation(symbol, open_symbol, period="60d")
+            if corr is not None and corr > max_corr:
+                max_corr = corr
+                most_correlated = open_symbol
+
+        if max_corr > 0.85:
+            return {
+                "action": "REJECT",
+                "max_correlation": round(max_corr, 4),
+                "reason": f"Correlation {max_corr:.2f} to {most_correlated} exceeds 0.85"
+            }
+        elif max_corr > 0.70:
+            return {
+                "action": "REDUCE_SIZE",
+                "max_correlation": round(max_corr, 4),
+                "reduction_factor": 0.70,
+                "reason": f"Correlation {max_corr:.2f} to {most_correlated}, reducing size"
+            }
+        else:
+            return {
+                "action": "ACCEPT",
+                "max_correlation": round(max_corr, 4),
+                "reason": f"Low correlation (max {max_corr:.2f})"
+            }
+
+    def _log_risk_decision(self, symbol: str, decision: str, details: str, outcome: str) -> None:
+        """Log risk decision to audit table"""
+        try:
+            conn = sqlite3.connect("positions.db", check_same_thread=False)
+            conn.execute(
+                """INSERT INTO risk_audit_log (timestamp, symbol, decision, details, outcome)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (datetime.now(timezone.utc).isoformat(), symbol, decision, details, outcome)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
     def execute_trade_plan(
         self,
         trade_plan: Dict[str, Any],
@@ -429,19 +539,70 @@ class ExecutionAgent:
         qty = validation["qty"]
         order_type = (trade_plan.get("order_type") or "MKT").upper()
         limit_price = trade_plan.get("limit_price")
+        entry_price = trade_plan.get("entry", {}).get("trigger_price")
+        stop_price = trade_plan.get("stop_loss", {}).get("price")
 
         preferred = (broker_preference or trade_plan.get("broker")) or "ibkr"
         preferred = preferred.lower()
 
+        # Simulation-Short-Circuit
         if self._should_simulate(preferred):
             receipt = self.simulate_order(symbol, side, qty, order_type, limit_price, broker="simulated")
             return {"status": "simulated", "broker": "simulated", "raw": receipt}
 
+        # Papier/LIVE Guard
         try:
             self._ensure_paper_guard()
         except RuntimeError as exc:
             return {"status": "blocked", "reason": str(exc)}
 
+        # ── RISK MANAGEMENT V3 CHECKS ──────────────────────────────────────
+        account_size = float(os.getenv("ACCOUNT_SIZE", "100000"))
+
+        # 1) Portfolio Drawdown Check
+        portfolio_dd = self._check_portfolio_drawdown(account_size)
+        if portfolio_dd["status"] == "halted":
+            self._log_risk_decision(symbol, "portfolio_halted", str(portfolio_dd), "REJECT")
+            return {"status": "blocked", "reason": f"Portfolio halted: {portfolio_dd['daily_drawdown_pct']}% DD"}
+        elif portfolio_dd["status"] == "paused" and trade_plan.get("action") == "open_position":
+            self._log_risk_decision(symbol, "portfolio_paused", str(portfolio_dd), "REJECT")
+            return {"status": "blocked", "reason": f"Portfolio paused: {portfolio_dd['daily_drawdown_pct']}% DD (close-only)"}
+
+        # 2) Adaptive Kelly Sizing
+        if trade_plan.get("action") == "open_position" and entry_price and stop_price:
+            kelly_result = compute_adaptive_kelly_size(
+                account_size=account_size,
+                buy_probability=0.56,  # From ML model accuracy
+                rr_ratio=1.91,  # From trade plan
+                max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.01")),
+                entry_price=entry_price,
+                stop_price=stop_price,
+                monthly_drawdown_pct=portfolio_dd.get("monthly_drawdown_pct", 0) / 100,
+                recent_win_count=5,  # TODO: Calculate from DB
+                recent_trade_count=10
+            )
+            kelly_qty = kelly_result.get("qty", 0)
+            if kelly_qty < qty:
+                qty = kelly_qty
+                self._log_risk_decision(
+                    symbol, "adaptive_kelly",
+                    f"Kelly: {kelly_result.get('kelly_fraction_adjusted', 0)}, DD: {portfolio_dd.get('monthly_drawdown_pct', 0)}%",
+                    "MODIFIED"
+                )
+                logger.info(f"[ExecutionAgent] Kelly sizing: {kelly_qty} shares (down from {validation['qty']})")
+
+        # 3) Correlation Filter (only for opening new positions)
+        if trade_plan.get("action") == "open_position":
+            corr_check = self._check_correlation_with_positions(symbol)
+            if corr_check["action"] == "REJECT":
+                self._log_risk_decision(symbol, "correlation_reject", str(corr_check), "REJECT")
+                return {"status": "blocked", "reason": corr_check["reason"]}
+            elif corr_check["action"] == "REDUCE_SIZE":
+                qty = int(qty * corr_check["reduction_factor"])
+                self._log_risk_decision(symbol, "correlation_reduce", str(corr_check), "MODIFIED")
+                logger.info(f"[ExecutionAgent] Correlation reduction: {qty} shares ({corr_check['reason']})")
+
+        # Cap Quantity
         qty, cap_info = self._cap_quantity(qty)
         if cap_info:
             validation["sizing"].update(cap_info)
@@ -449,22 +610,28 @@ class ExecutionAgent:
         try:
             if instrument_type in {"fx", "forex"}:
                 res = self.place_oanda_order(symbol, side, qty)
+                self._log_risk_decision(symbol, "execution_oanda", "", "SENT")
                 return {"status": "sent", "broker": "oanda", "raw": res}
 
             if preferred == "alpaca":
                 res = self.place_alpaca_order(symbol, side, qty, order_type.lower(), limit_price)
+                self._log_risk_decision(symbol, "execution_alpaca", f"qty={qty}", "SENT")
                 return {"status": "sent", "broker": "alpaca", "raw": res}
 
             if preferred == "tradier":
                 res = self.place_tradier_order(symbol, side, qty, order_type.lower(), limit_price)
+                self._log_risk_decision(symbol, "execution_tradier", f"qty={qty}", "SENT")
                 return {"status": "sent", "broker": "tradier", "raw": res}
 
+            # Default IBKR path
             res = self.place_ibkr_order(symbol, side, qty, instrument_type, order_type, limit_price)
+            self._log_risk_decision(symbol, "execution_ibkr", f"qty={qty}", "SENT")
             return {"status": "sent", "broker": "ibkr", "raw": res}
         except Exception as exc:
             logger.exception("Execution Fehler: %s", exc)
+            self._log_risk_decision(symbol, "execution_error", str(exc), "ERROR")
             return {"status": "error", "reason": str(exc)}
-
+# ...existing code...
 
 # ============================================================
 # 4. Timeframe Mapping
@@ -501,6 +668,15 @@ def _map_timeframe_to_ibkr(timeframe: str) -> Tuple[str, int]:
 _news_client = NewsClient()
 _options_agent = OptionsAgent()
 _execution_agent = ExecutionAgent()
+
+# Position-Monitor Singleton initialisieren
+from risk import CircuitBreaker as _CB
+_single_cb = _CB(n_errors=8, n_losses=3, cooldown_seconds=1800)
+_pm_module.monitor = _pm_module.PositionMonitor(
+    execution_agent=_execution_agent,
+    circuit_breaker=_single_cb,
+    check_interval_seconds=int(os.getenv("MONITOR_INTERVAL_SECONDS", "60")),
+)
 
 if DataAgent is not None:
     _data_agent = DataAgent()
@@ -545,9 +721,15 @@ def run_single_symbol_mode(
         timeframe=timeframe,
     )
 
-    # Markt-Meta inkl. letztem Schlusskurs ableiten
+    # Indikatoren berechnen und in market_data einbetten
     candles = market_data.get("candles") or []
+    indicators = compute_indicators(candles)
+    market_data["indicators"] = indicators
+
+    # Markt-Meta inkl. letztem Schlusskurs + ATR ableiten
     market_meta = dict(market_data.get("meta") or {})
+    market_meta["atr_14"]  = indicators.get("atr_14")
+    market_meta["atr_pct"] = indicators.get("atr_pct")
     if candles:
         last = candles[-1]
         try:
@@ -578,16 +760,27 @@ def run_single_symbol_mode(
         for item in (combined_news or [])
         if item.get("headline")
     ]
-    news_output = call_gpt_agent("news_agent", {"symbol": symbol, "recent_news": recent_news})
+    news_output = safe_call_gpt_agent("news_agent", {"symbol": symbol, "recent_news": recent_news})
 
-    # 3) Analyse-Agents
-    regime_output = call_gpt_agent("regime_agent", {"symbol": symbol, "market_data": market_data})
-    trend_output = call_gpt_agent("trend_dow_agent", {"symbol": symbol, "market_data": market_data})
-    sr_output = call_gpt_agent("sr_formations_agent", {"symbol": symbol, "market_data": market_data})
-    momentum_output = call_gpt_agent("momentum_agent", {"symbol": symbol, "market_data": market_data})
-    volume_output = call_gpt_agent("volume_oi_agent", {"symbol": symbol, "market_data": market_data})
-    candle_output = call_gpt_agent("candlestick_agent", {"symbol": symbol, "market_data": market_data})
-    intermarket_output = call_gpt_agent("intermarket_agent", {"symbol": symbol, "market_data": market_data})
+    # 3) Analyse-Agents (parallel statt sequenziell)
+    agent_tasks = [
+        partial(safe_call_gpt_agent, "regime_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "trend_dow_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "sr_formations_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "momentum_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "volume_oi_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "candlestick_agent", {"symbol": symbol, "market_data": market_data}),
+        partial(safe_call_gpt_agent, "intermarket_agent", {"symbol": symbol, "market_data": market_data}),
+    ]
+    agent_results = run_calls_parallel(agent_tasks, max_workers=3, per_call_timeout=30.0)
+
+    regime_output = agent_results[0] or {"error": "no_result"}
+    trend_output = agent_results[1] or {"error": "no_result"}
+    sr_output = agent_results[2] or {"error": "no_result"}
+    momentum_output = agent_results[3] or {"error": "no_result"}
+    volume_output = agent_results[4] or {"error": "no_result"}
+    candle_output = agent_results[5] or {"error": "no_result"}
+    intermarket_output = agent_results[6] or {"error": "no_result"}
 
     # 4) Synthese
     synth_input = {
@@ -601,13 +794,17 @@ def run_single_symbol_mode(
         "intermarket_output": intermarket_output,
         "news_output": news_output,
     }
-    synthese_output = call_gpt_agent("synthese_agent", synth_input)
+    synthese_output = safe_call_gpt_agent("synthese_agent", synth_input)
 
-    # 5) Signal
-    signal_output = call_gpt_agent(
-        "signal_scanner_agent",
-        {"symbol": symbol, "synthese_output": synthese_output},
-    )
+    # 5) Signal — ML-Modell, GPT als Fallback
+    from DEF_ML_SIGNAL import _engine as _ml_engine
+    if _ml_engine.is_loaded:
+        signal_output = _ml_engine.predict(candles, symbol=symbol)
+    else:
+        signal_output = safe_call_gpt_agent(
+            "signal_scanner_agent",
+            {"symbol": symbol, "synthese_output": synthese_output},
+        )
 
     # 6) Handel
     handels_input = {
@@ -617,7 +814,7 @@ def run_single_symbol_mode(
         "account_info": account_info,
         "market_meta": market_meta,
     }
-    trade_plan = call_gpt_agent("handels_agent", handels_input)
+    trade_plan = safe_call_gpt_agent("handels_agent", handels_input)
 
     # Options-Plan (analytisch)
     options_plan = None
@@ -638,10 +835,16 @@ def run_single_symbol_mode(
     if options_plan is not None and isinstance(trade_plan, dict):
         trade_plan["options_plan"] = options_plan
 
+    # ATR für Trailing Stop einspeichern
+    if isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
+        trade_plan["_atr_14"] = market_meta.get("atr_14")
+
     execution_result = None
     if auto_execute and isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
         broker_pref = account_info.get("broker_preference")
         execution_result = _execution_agent.execute_trade_plan(trade_plan, broker_pref)
+        if _pm_module.monitor:
+            _pm_module.monitor.open_position(trade_plan, execution_result)
 
     return {
         "symbol": symbol,
