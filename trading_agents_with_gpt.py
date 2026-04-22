@@ -363,6 +363,14 @@ class ExecutionAgent:
         }
         return http_post(url, body, headers={"Authorization": f"Bearer {api_key}"})
 
+    @staticmethod
+    def _normalize_alpaca_order_type(order_type: str) -> str:
+        """Normalize semantic order types to valid Alpaca API types."""
+        normalized = order_type.lower().strip()
+        if normalized in {"market", "limit", "stop", "stop_limit"}:
+            return normalized
+        return "market"  # Default fallback for semantic types like BREAKOUT
+
     def place_alpaca_order(
         self,
         symbol: str,
@@ -378,14 +386,15 @@ class ExecutionAgent:
 
         base = CONFIG["alpaca"]["base_url"]
         url = f"{base}/v2/orders"
+        normalized_type = self._normalize_alpaca_order_type(order_type)
         body = {
             "symbol": symbol,
             "side": side.lower(),
-            "type": order_type,
+            "type": normalized_type,
             "qty": qty,
             "time_in_force": "day",
         }
-        if order_type in {"limit", "stop_limit"} and limit_price is not None:
+        if normalized_type in {"limit", "stop_limit"} and limit_price is not None:
             body["limit_price"] = limit_price
 
         return http_post(
