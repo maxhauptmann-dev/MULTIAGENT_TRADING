@@ -1,0 +1,25 @@
+# Auf deinem Mac Terminal:
+ssh root@87.106.167.252
+
+# Dann kannst du direkt arbeiten:
+
+# 1. Bot Status
+ps aux | grep validated_trader
+
+# 2. Live Log anschauen (Echtzeit)
+tail -f /tmp/trading_bot.log
+
+# 3. In Linux lernen - beliebige Befehle:
+ls -la
+cat /etc/os-release
+df -h
+# etc...
+
+# 4. Linux Dateien editieren:
+nano /opt/trading_bot/validated_trader.py
+
+
+Terminal öffnen auf Mac: ssh root@87.106.167.252
+Linux Commands lernen direkt im Terminal
+Bot überwachen mit tail -f /tmp/trading_bot.log
+Code editieren mit nano oder vim

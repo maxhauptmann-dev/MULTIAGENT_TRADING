@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
@@ -73,8 +73,6 @@ class NewsClient:
                 print(f"[NewsClient] Fehler bei SerpAPI-News für {symbol}: {e}")
 
         # Nach Datum sortieren (neueste zuerst, soweit parsebar)
-        from datetime import timezone
-
         def _parse_dt(x: Dict[str, Any]) -> datetime:
             ts = x.get("published_at")
             if not ts:

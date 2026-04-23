@@ -3,6 +3,7 @@
 from trading_agents_with_gpt import run_single_symbol_mode
 from DEF_SCANNER_MODE import run_scanner_mode
 from universe_manager import manager as universe_manager
+import position_monitor as _pm_module
 
 def format_single_result(result):
     symbol = result.get("symbol")
@@ -202,17 +203,41 @@ def format_scanner_results(result):
 # START-MENÜ
 # =================================================================
 
+def _print_monitor_stats() -> None:
+    if _pm_module.monitor is None:
+        return
+    s = _pm_module.monitor.stats()
+    print("\n=== Position-Monitor Stats ===")
+    print(f"  Gesamt Trades:  {s['total_trades']}")
+    print(f"  Offen:          {s['open']}")
+    print(f"  Take-Profit:    {s['closed_take_profit']}")
+    print(f"  Stop-Loss:      {s['closed_stop_loss']}")
+    print(f"  Gesamt P&L:     {s['total_pnl']:+.2f}")
+    wr = s["win_rate"]
+    print(f"  Win-Rate:       {f'{wr:.1%}' if wr is not None else 'n/a'}")
+
+
 def start():
     print("=== Trading Agent Orchestrator ===")
     print("1) Einzelmodus")
     print("2) Scannermodus (nach Universum)")
-    choice = input("Modus wählen (1/2): ").strip()
+    print("3) Offene Positionen anzeigen")
+    print("4) Trade-Historie anzeigen")
+    print("5) Automatischer Scheduler starten (Daemon)")
+    print("6) Backtest")
+    print("7) ML-Modell trainieren")
+    choice = input("Modus wählen (1-7): ").strip()
 
-    # hier kannst du später echte Account-Daten reinpacken / aus .env lesen
+    # Monitor starten (Hintergrund-Thread für SL/TP-Überwachung)
+    if _pm_module.monitor and not (_pm_module.monitor._thread and _pm_module.monitor._thread.is_alive()):
+        _pm_module.monitor.start()
+        print("[Monitor] Positions-Überwachung gestartet.")
+
+    import os
     account_info = {
-        "account_size": 100000,
-        "max_risk_per_trade": 0.01,
-        "broker_preference": "IBKR",
+        "account_size": float(os.getenv("ACCOUNT_SIZE", "100000")),
+        "max_risk_per_trade": float(os.getenv("MAX_RISK_PER_TRADE", "0.01")),
+        "broker_preference": os.getenv("BROKER_PREFERENCE", "ibkr"),
     }
 
     # ---------------------------------------------------------
@@ -225,6 +250,7 @@ def start():
             return
 
         timeframe = input("Timeframe (z.B. 1D, 4H, 1H) [Default 1D]: ").strip() or "1D"
+        auto_ex = input("Auto-Execute aktivieren? (nur Simulate/Paper) [j/N]: ").strip().lower() == "j"
 
         result = run_single_symbol_mode(
             symbol=symbol,
@@ -232,9 +258,10 @@ def start():
             timeframe=timeframe,
             asset_type="stock",
             market_hint="US",
-            auto_execute=False,
+            auto_execute=auto_ex,
         )
         format_single_result(result)
+        _print_monitor_stats()
 
     # ---------------------------------------------------------
     # 2) SCANNERMODUS – UNIVERSEN
@@ -276,6 +303,7 @@ def start():
             print("...")
 
         timeframe = input("Timeframe für Scanner [Default 1D]: ").strip() or "1D"
+        auto_ex = input("Auto-Execute aktivieren? (nur Simulate/Paper) [j/N]: ").strip().lower() == "j"
 
         result = run_scanner_mode(
             watchlist=watchlist,
@@ -283,9 +311,107 @@ def start():
             timeframe=timeframe,
             asset_type="stock",
             market_hint="US",
-            auto_execute=False,
+            auto_execute=auto_ex,
         )
         format_scanner_results(result)
+        _print_monitor_stats()
+
+    # ---------------------------------------------------------
+    # 3) OFFENE POSITIONEN
+    # ---------------------------------------------------------
+    elif choice == "3":
+        if _pm_module.monitor is None:
+            print("Position-Monitor nicht initialisiert.")
+            return
+        positions = _pm_module.monitor.get_open_positions()
+        if not positions:
+            print("\nKeine offenen Positionen.")
+        else:
+            print(f"\n=== Offene Positionen ({len(positions)}) ===")
+            for p in positions:
+                print(
+                    f"  #{p['id']} {p['direction'].upper():5} {p['symbol']:8} "
+                    f"x{p['quantity']:.2f}  Entry={p['entry_price']}  "
+                    f"SL={p['stop_loss']}  TP={p['take_profit']}  "
+                    f"seit {p['opened_at'][:19]}"
+                )
+
+    # ---------------------------------------------------------
+    # 4) TRADE-HISTORIE
+    # ---------------------------------------------------------
+    elif choice == "4":
+        if _pm_module.monitor is None:
+            print("Position-Monitor nicht initialisiert.")
+            return
+        history = _pm_module.monitor.get_history(limit=20)
+        if not history:
+            print("\nNoch keine Trades in der Datenbank.")
+        else:
+            print(f"\n=== Letzte {len(history)} Trades ===")
+            for p in history:
+                pnl = f"{p['pnl']:+.2f}" if p["pnl"] is not None else "offen"
+                print(
+                    f"  #{p['id']} {p['direction'].upper():5} {p['symbol']:8} "
+                    f"Status={p['status']:25} P&L={pnl}"
+                )
+        _print_monitor_stats()
+
+    # ---------------------------------------------------------
+    # 5) SCHEDULER (Daemon)
+    # ---------------------------------------------------------
+    elif choice == "5":
+        from scheduler import TradingScheduler
+        import signal as _signal
+
+        print("\n[Scheduler] Starte automatischen Trading-Daemon.")
+        print("  Konfiguration: SCHEDULER_MARKETS, SCHEDULER_UNIVERSE, SCHEDULER_AUTO_EXECUTE")
+        print("  Beenden mit Ctrl+C\n")
+
+        sched = TradingScheduler()
+
+        def _stop(sig, _):
+            sched.stop()
+            sys.exit(0)
+
+        import sys
+        _signal.signal(_signal.SIGINT, _stop)
+        _signal.signal(_signal.SIGTERM, _stop)
+        sched.start()  # blockiert
+
+    # ---------------------------------------------------------
+    # 6) BACKTEST
+    # ---------------------------------------------------------
+    elif choice == "6":
+        from BACKTEST import fetch_candles_yfinance, run_backtest, print_report, plot_equity_curve
+
+        symbol   = input("Symbol (z.B. AAPL, SAP) [AAPL]: ").strip().upper() or "AAPL"
+        period   = input("Zeitraum (1y/2y/5y) [2y]: ").strip() or "2y"
+        acc_raw  = input("Startkapital [100000]: ").strip()
+        acct     = float(acc_raw) if acc_raw else account_info["account_size"]
+        risk_raw = input("Max Risiko/Trade (z.B. 0.01) [0.01]: ").strip()
+        risk     = float(risk_raw) if risk_raw else account_info["max_risk_per_trade"]
+
+        print(f"\nLade {symbol} ({period}) via yfinance...")
+        try:
+            candles = fetch_candles_yfinance(symbol, period=period)
+        except Exception as exc:
+            print(f"Fehler: {exc}")
+            return
+
+        print(f"{len(candles)} Candles geladen. Simuliere...")
+        result = run_backtest(candles, account_size=acct, max_risk_per_trade=risk)
+        print_report(result, symbol)
+
+        if input("Equity-Kurve anzeigen? [j/N]: ").strip().lower() == "j":
+            plot_equity_curve(result, symbol)
+
+    # ---------------------------------------------------------
+    # 7) ML-MODELL TRAINIEREN
+    # ---------------------------------------------------------
+    elif choice == "7":
+        import subprocess, sys
+        print("\n[ML] Starte TRAIN_MODEL.py …")
+        subprocess.run([sys.executable, "TRAIN_MODEL.py"], check=False)
 
     else:
         print("Ungültige Wahl.")

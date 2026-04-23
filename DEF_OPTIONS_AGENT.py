@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass
@@ -82,7 +82,7 @@ class OptionsAgent:
         max_risk_amount = pos_sizing.get("max_risk_amount") or account_info.get("account_size", 0) * account_info.get("max_risk_per_trade", 0.01)
 
         # 6) Optional: grober Expiry-Hinweis (ohne echte Optionskette)
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         mid_dte = int((dte_min + dte_max) / 2)
         expiry_hint = today + timedelta(days=mid_dte)
 

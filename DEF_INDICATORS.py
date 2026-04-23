@@ -225,3 +225,87 @@ def calculate_symbol_correlation(symbol_a: str, symbol_b: str, period: str = "60
 
     except Exception:
         return None
+
+
+# ── Market Regime Detection (SPY/QQQ Trend Analysis) ───────────────────────────
+
+def compute_market_regime() -> Dict[str, Any]:
+    """
+    Detects broad market regime (bull/bear/neutral) via SPY and QQQ EMA20 crosses.
+
+    Returns:
+        {
+            "regime": "bull" | "bear" | "neutral",
+            "spy_vs_ema20": float (% price above/below EMA20),
+            "qqq_vs_ema20": float (% price above/below EMA20),
+            "vix": float (current VIX level)
+        }
+
+    Logic:
+        - "bull":    SPY > EMA20 AND QQQ > EMA20
+        - "bear":    SPY < EMA20 AND QQQ < EMA20
+        - "neutral": Mixed or VIX > 25
+    """
+    try:
+        import yfinance as yf
+        import pandas as pd
+
+        # Fetch SPY and QQQ (10d, daily) – enough to calculate EMA20
+        spy_data = yf.download("SPY", period="30d", interval="1d", progress=False)
+        qqq_data = yf.download("QQQ", period="30d", interval="1d", progress=False)
+
+        if spy_data.empty or qqq_data.empty:
+            return {
+                "regime": "neutral",
+                "spy_vs_ema20": 0.0,
+                "qqq_vs_ema20": 0.0,
+                "vix": get_vix_level(),
+                "error": "Could not fetch SPY/QQQ data",
+            }
+
+        # Compute EMA20 for both
+        spy_ema20 = _last(ta.ema(spy_data["Close"], length=20)) if _AVAILABLE else None
+        qqq_ema20 = _last(ta.ema(qqq_data["Close"], length=20)) if _AVAILABLE else None
+
+        spy_close = float(spy_data["Close"].iloc[-1])
+        qqq_close = float(qqq_data["Close"].iloc[-1])
+
+        # Calculate % difference from EMA20
+        spy_vs_ema20 = round((spy_close - spy_ema20) / spy_ema20 * 100, 3) if spy_ema20 else 0.0
+        qqq_vs_ema20 = round((qqq_close - qqq_ema20) / qqq_ema20 * 100, 3) if qqq_ema20 else 0.0
+
+        vix = get_vix_level()
+
+        # Classify regime
+        if spy_ema20 and qqq_ema20:
+            spy_above = spy_close > spy_ema20
+            qqq_above = qqq_close > qqq_ema20
+
+            if spy_above and qqq_above:
+                regime = "bull"
+            elif not spy_above and not qqq_above:
+                regime = "bear"
+            else:
+                regime = "neutral"
+        else:
+            regime = "neutral"
+
+        # Override to neutral if VIX is very high (uncertainty)
+        if vix > 25:
+            regime = "neutral"
+
+        return {
+            "regime": regime,
+            "spy_vs_ema20": spy_vs_ema20,
+            "qqq_vs_ema20": qqq_vs_ema20,
+            "vix": vix,
+        }
+
+    except Exception as exc:
+        return {
+            "regime": "neutral",
+            "spy_vs_ema20": 0.0,
+            "qqq_vs_ema20": 0.0,
+            "vix": get_vix_level(),
+            "error": str(exc),
+        }

@@ -18,7 +18,9 @@ PROMPTS: Dict[str, str] = {
 
     "regime_agent": """
 Du bist der Regime-Agent in einem Trading-System.
-Input: JSON mit {symbol, timeframe, candles[], meta}.
+Input: JSON mit {symbol, timeframe, candles[], meta, indicators}.
+Vorberechnete Indikatoren in market_data.indicators: adx, adx_strength, atr_14, atr_pct, ema_trend.
+Nutze diese Werte DIREKT (nicht selbst berechnen): adx > 25 = Trend, < 25 = Range; atr_pct für Volatilität.
 Aufgabe:
 - Marktregime bestimmen: "trending_up", "trending_down" oder "rangebound".
 - Volatilität klassifizieren: "low", "normal", "high".
@@ -88,10 +90,13 @@ Antworte NUR mit JSON:
 
     "momentum_agent": """
 Du bist der Momentum-Agent.
-Input: Marktdaten.
+Input: Marktdaten mit vorberechneten Indikatoren in market_data.indicators.
+WICHTIG: Nutze diese Werte DIREKT aus market_data.indicators (nicht selbst schätzen):
+  rsi_14, rsi_zone, macd_value, macd_signal, macd_cross, macd_hist,
+  stoch_k, stoch_d, stoch_signal.
 Aufgabe:
-- Momentum-Bias (bullish/bearish/neutral).
-- RSI-Zone, Divergenzen.
+- Momentum-Bias (bullish/bearish/neutral) auf Basis der gelieferten Indikatoren ableiten.
+- Divergenzen falls erkennbar benennen.
 Antworte NUR mit JSON:
 {
   "symbol": "...",
@@ -284,8 +289,25 @@ Input ist ein JSON-Objekt mit ungefähr dieser Struktur:
     "last_open": float | null,
     "last_high": float | null,
     "last_low": float | null
+  },
+  "market_regime": "bull"|"bear"|"neutral",
+  "market_regime_info": {
+    "regime": string,
+    "spy_vs_ema20": float,
+    "qqq_vs_ema20": float,
+    "vix": float
   }
 }
+
+MARKT-REGIME-GATE:
+Das Feld "market_regime" enthält die Breitmrkt-Trendrichtung (SPY & QQQ):
+- "bull":    Markt im Aufwärtstrend. Bevorzuge LONG. Bei bearish Symbol-Signalen → "no_trade" statt "short".
+- "bear":    Markt im Abwärtstrend. Bevorzuge SHORT. Bei bullish Symbol-Signalen → "no_trade" statt "long".
+- "neutral": Keine Verzerrung. Entscheide nach Symbol-Signalen allein.
+
+Synchronisation:
+- Wenn market_regime und Symbol-Signal übereinstimmen: höhere Konfidenz, "action" = "open_position".
+- Wenn market_regime und Symbol-Signal widersprechen: konservativ "no_trade" ausgeben.
 
 Aufgabe:
 
@@ -294,6 +316,7 @@ Aufgabe:
 
 2. Wenn "action" = "open_position":
    - Leite eine Richtung ab: "long" oder "short".
+   - BEACHTE: Richte dich nach market_regime (siehe oben).
    - Verwende "market_meta.last_close" als Referenzpreis.
    - Wähle einen "entry.trigger_price", der im Normalfall NICHT weiter als ±3 % vom "last_close" entfernt liegt.
    - Nur wenn das Setup ausdrücklich auf einem deutlich weiter entfernten Level
@@ -301,7 +324,9 @@ Aufgabe:
      In diesem Fall MUSST du das in "reason" und/oder "warnings" explizit begründen.
 
 3. Stop-Loss und Take-Profit:
-   - "stop_loss.price" soll logisch zum "trigger_price" passen (vernünftige Distanz).
+   - Nutze "market_meta.atr_14" (Average True Range) für die Stop-Distanz:
+     empfohlene Stop-Distanz = 1.5 × ATR bis 2.5 × ATR vom Entry.
+   - Falls atr_14 fehlt oder null: vernünftige Distanz selbst wählen und in "warnings" vermerken.
    - "take_profit.target_price" so wählen, dass "reward_risk_ratio" sinnvoll ist
      (z.B. 1.5–4.0, im Zweifel konservativ).
 
@@ -375,6 +400,7 @@ def call_gpt_agent(agent_name: str, payload: Dict[str, Any],
             model=model,
             messages=messages,
             temperature=temperature,
+            response_format={"type": "json_object"},
         )
     except Exception as e:
         return {"error": "api_error", "exception": repr(e), "agent_name": agent_name}
