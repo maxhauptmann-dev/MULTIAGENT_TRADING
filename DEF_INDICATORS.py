@@ -272,12 +272,16 @@ def compute_market_regime() -> Dict[str, Any]:
                 "error": "Could not fetch SPY/QQQ data",
             }
 
-        # Compute EMA20 for both
-        spy_ema20 = _last(ta.ema(spy_data["Close"], length=20)) if _AVAILABLE else None
-        qqq_ema20 = _last(ta.ema(qqq_data["Close"], length=20)) if _AVAILABLE else None
+        # yfinance returns multi-index DataFrame: extract Series
+        spy_close_series = spy_data["Close"].iloc[:, 0] if isinstance(spy_data["Close"], pd.DataFrame) else spy_data["Close"]
+        qqq_close_series = qqq_data["Close"].iloc[:, 0] if isinstance(qqq_data["Close"], pd.DataFrame) else qqq_data["Close"]
 
-        spy_close = float(spy_data["Close"].iloc[-1])
-        qqq_close = float(qqq_data["Close"].iloc[-1])
+        # Compute EMA20 for both
+        spy_ema20 = _last(ta.ema(spy_close_series, length=20)) if _AVAILABLE else None
+        qqq_ema20 = _last(ta.ema(qqq_close_series, length=20)) if _AVAILABLE else None
+
+        spy_close = float(spy_close_series.iloc[-1])
+        qqq_close = float(qqq_close_series.iloc[-1])
 
         # Calculate % difference from EMA20
         spy_vs_ema20 = round((spy_close - spy_ema20) / spy_ema20 * 100, 3) if spy_ema20 else 0.0
