@@ -343,14 +343,25 @@ class PositionMonitor:
 
                     # ── AGGRESSIVE Profit Lock-In (Swing Trading) ──────────────
                     profit_pct = (price - entry) / entry if entry > 0 else 0
-                    if profit_pct >= 0.10:  # +10% profit → close half, lock rest at +5%
+
+                    # Use highest_price as peak (updated throughout position life)
+                    peak_price = highest
+
+                    if profit_pct >= 0.10:  # +10% profit → lock at +5%
                         trailing_sl = max(trailing_sl, entry * 1.05)
-                    elif profit_pct >= 0.05:  # +5% profit → move to +2% lock
+                    elif profit_pct >= 0.05:  # +5% profit → lock at +2%
                         trailing_sl = max(trailing_sl, entry * 1.02)
                     elif profit_pct >= 0.02:  # +2% profit → lock at breakeven
                         trailing_sl = max(trailing_sl, entry * 1.00)
 
-                    sl = trailing_sl
+                    # KEY FEATURE: If price falls below highest peak reached → SELL with profit
+                    # This prevents giving back gains after +2%/+5%/+10% milestones hit
+                    if peak_price > entry and price < (peak_price * 0.99):  # 1% below peak
+                        sl = price + 0.01  # Sell immediately when profit erodes
+                        reason = "profit_peak_reversal"
+                    else:
+                        sl = trailing_sl
+                        reason = None
                 else:  # short
                     # Update lowest price for short positions
                     lowest = float(pos.get("lowest_price") or entry or price)
