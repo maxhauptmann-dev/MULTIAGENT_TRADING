@@ -480,7 +480,7 @@ class PositionMonitor:
     # ── Preisfetcher ──────────────────────────────────────────────────────────
 
     def _get_price(self, symbol: str) -> Optional[float]:
-        """Finnhub → Alpaca → None."""
+        """Finnhub → Alpaca → yfinance (fallback)."""
         # 1) Finnhub
         if self._finnhub_key:
             try:
@@ -513,6 +513,18 @@ class PositionMonitor:
                         return float(price)
             except Exception:
                 pass
+
+        # 3) yfinance (fallback für autonome VPS operation)
+        try:
+            import yfinance as yf
+            df = yf.download(symbol, period="1d", progress=False, timeout=10)
+            if not df.empty:
+                last_close = df["Close"].iloc[-1]
+                price = float(last_close) if last_close is not None else None
+                if price and price > 0:
+                    return price
+        except Exception:
+            pass
 
         return None
 
