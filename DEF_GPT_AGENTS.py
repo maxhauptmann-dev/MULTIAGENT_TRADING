@@ -301,13 +301,15 @@ Input ist ein JSON-Objekt mit ungefähr dieser Struktur:
 
 MARKT-REGIME-GATE:
 Das Feld "market_regime" enthält die Breitmrkt-Trendrichtung (SPY & QQQ):
-- "bull":    Markt im Aufwärtstrend. Bevorzuge LONG. Bei bearish Symbol-Signalen → "no_trade" statt "short".
-- "bear":    Markt im Abwärtstrend. Bevorzuge SHORT. Bei bullish Symbol-Signalen → "no_trade" statt "long".
+- "bull":    Markt im Aufwärtstrend. Bevorzuge LONG-Trades. SHORT-Signale → mit Vorsicht oder "no_trade".
+- "bear":    Markt im Abwärtstrend. Bevorzuge SHORT-Trades. LONG-Signale → mit Vorsicht oder "no_trade".
 - "neutral": Keine Verzerrung. Entscheide nach Symbol-Signalen allein.
 
-Synchronisation:
-- Wenn market_regime und Symbol-Signal übereinstimmen: höhere Konfidenz, "action" = "open_position".
-- Wenn market_regime und Symbol-Signal widersprechen: konservativ "no_trade" ausgeben.
+Synchronisation - WICHTIG:
+- Wenn market_regime und Symbol-Signal übereinstimmen (z.B. bear + bearish signal): "action" = "open_position" mit höherer Konfidenz
+- Wenn market_regime und Symbol-Signal widersprechen (z.B. bear + bullish signal): konservativ "no_trade" oder sehr niedriges Risiko
+- SHORT-Signale in BEAR-Markt: IMMER bevorzugen wenn technisch valide
+- LONG-Signale in BULL-Markt: IMMER bevorzugen wenn technisch valide
 
 Aufgabe:
 
@@ -316,7 +318,10 @@ Aufgabe:
 
 2. Wenn "action" = "open_position":
    - Leite eine Richtung ab: "long" oder "short".
-   - BEACHTE: Richte dich nach market_regime (siehe oben).
+   - BEACHTE: Richte dich STRIKT nach market_regime:
+     * BEAR-Markt: SHORT bevorzugen, nur LONG wenn extrem starkes Signal
+     * BULL-Markt: LONG bevorzugen, nur SHORT wenn extrem starkes Signal
+     * NEUTRAL: Nach Symbol-Signalen allein
    - Verwende "market_meta.last_close" als Referenzpreis.
    - Wähle einen "entry.trigger_price", der im Normalfall NICHT weiter als ±3 % vom "last_close" entfernt liegt.
    - Nur wenn das Setup ausdrücklich auf einem deutlich weiter entfernten Level
