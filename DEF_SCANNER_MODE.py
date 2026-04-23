@@ -256,8 +256,16 @@ def _process_symbol(
         if options_plan is not None and isinstance(trade_plan, dict):
             trade_plan["options_plan"] = options_plan
 
-        # Execution
+        # Execution – skip if position already open
         execution_result = None
+        if auto_execute and isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
+            # Check if position already open to avoid duplicate buys
+            if _pm_module.monitor:
+                open_pos = _pm_module.monitor.get_open_positions()
+                if any(p.get("symbol") == symbol for p in open_pos):
+                    trade_plan["action"] = "no_trade"
+                    trade_plan["reason"] = "position_already_open"
+
         if auto_execute and isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
             broker_pref = account_info.get("broker_preference")
             execution_result = _execution_agent.execute_trade_plan(trade_plan, broker_pref)
