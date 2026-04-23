@@ -321,9 +321,10 @@ class PositionMonitor:
             atr_14 = pos.get("atr_14")
             reason = None
 
-            # ── Trailing Stop mit adaptivem ATR Multiplikator ─────────────────
+            # ── Trailing Stop mit adaptivem ATR Multiplikator (Swing Trading) ─
             if atr_14 and float(atr_14) > 0:
-                trailing_mult = atr_mult_adaptive
+                # For swing trading: use tighter multiplier (1.2x instead of 1.5-3.0x)
+                trailing_mult = 1.2
 
                 if direction == "long":
                     # Update highest price for long positions
@@ -337,17 +338,17 @@ class PositionMonitor:
                             )
                             conn.commit()
 
-                    # Calculate trailing SL
+                    # Calculate trailing SL (tight for swing trading)
                     trailing_sl = highest - (trailing_mult * float(atr_14))
 
-                    # ── Profit Lock-In Levels ────────────────────────────────
+                    # ── AGGRESSIVE Profit Lock-In (Swing Trading) ──────────────
                     profit_pct = (price - entry) / entry if entry > 0 else 0
-                    if profit_pct >= 0.20:  # +20% profit
-                        trailing_sl = max(trailing_sl, entry * 1.10)  # Lock at +10%
-                    elif profit_pct >= 0.10:  # +10% profit
-                        trailing_sl = max(trailing_sl, entry * 1.02)  # Lock at +2%
-                    elif profit_pct >= 0.05:  # +5% profit
-                        trailing_sl = max(trailing_sl, entry)  # Lock at breakeven
+                    if profit_pct >= 0.10:  # +10% profit → close half, lock rest at +5%
+                        trailing_sl = max(trailing_sl, entry * 1.05)
+                    elif profit_pct >= 0.05:  # +5% profit → move to +2% lock
+                        trailing_sl = max(trailing_sl, entry * 1.02)
+                    elif profit_pct >= 0.02:  # +2% profit → lock at breakeven
+                        trailing_sl = max(trailing_sl, entry * 1.00)
 
                     sl = trailing_sl
                 else:  # short
@@ -362,17 +363,17 @@ class PositionMonitor:
                             )
                             conn.commit()
 
-                    # Calculate trailing SL for shorts
+                    # Calculate trailing SL for shorts (tight)
                     trailing_sl = lowest + (trailing_mult * float(atr_14))
 
-                    # ── Profit Lock-In for Shorts ────────────────────────────
+                    # ── AGGRESSIVE Profit Lock-In for Shorts ──────────────────
                     profit_pct = (entry - price) / entry if entry > 0 else 0
-                    if profit_pct >= 0.20:  # +20% profit
-                        trailing_sl = min(trailing_sl, entry * 0.90)  # Lock at +10%
-                    elif profit_pct >= 0.10:  # +10% profit
-                        trailing_sl = min(trailing_sl, entry * 0.98)  # Lock at +2%
-                    elif profit_pct >= 0.05:  # +5% profit
-                        trailing_sl = min(trailing_sl, entry)  # Lock at breakeven
+                    if profit_pct >= 0.10:  # +10% profit → lock at +5%
+                        trailing_sl = min(trailing_sl, entry * 0.95)
+                    elif profit_pct >= 0.05:  # +5% profit → lock at +2%
+                        trailing_sl = min(trailing_sl, entry * 0.98)
+                    elif profit_pct >= 0.02:  # +2% profit → lock at breakeven
+                        trailing_sl = min(trailing_sl, entry * 1.00)
 
                     sl = trailing_sl
 
