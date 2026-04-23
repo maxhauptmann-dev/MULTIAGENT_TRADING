@@ -23,8 +23,17 @@ def _last(series) -> Optional[float]:
     """Letzter nicht-NaN Wert einer Series, gerundet auf 4 Stellen."""
     if series is None:
         return None
-    clean = series.dropna()
-    return round(float(clean.iloc[-1]), 4) if len(clean) > 0 else None
+    try:
+        if hasattr(series, 'dropna'):
+            clean = series.dropna()
+        else:
+            clean = series
+        if len(clean) > 0:
+            val = clean.iloc[-1]
+            return round(float(val), 4)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def compute_indicators(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
