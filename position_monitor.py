@@ -109,7 +109,12 @@ def _init_db() -> None:
             ("atr_multiplier_used", "REAL"),
             ("kelly_fraction_used", "REAL"),
             ("profit_locked_at_pct", "REAL"),
-            ("correlation_check_json", "TEXT")
+            ("correlation_check_json", "TEXT"),
+            ("quantity_remaining", "REAL"),
+            ("profit_levels_hit", "TEXT"),
+            ("last_profit_pct", "REAL"),
+            ("highest_locked_profit_pct", "REAL"),
+            ("profit_lock_levels", "TEXT")
         ]
         for col, typedef in migration_cols:
             try:
@@ -137,10 +142,12 @@ class PositionMonitor:
         execution_agent,
         circuit_breaker=None,
         check_interval_seconds: int = 60,
+        hard_stop_loss_pct: float = 0.05,
     ) -> None:
         self.execution_agent = execution_agent
         self.circuit_breaker = circuit_breaker
         self.check_interval = check_interval_seconds
+        self.hard_stop_loss_pct = hard_stop_loss_pct  # 5% default hard stop
         self._finnhub_key = os.getenv("FINNHUB_API_KEY")
         self._alpaca_key = os.getenv("ALPACA_API_KEY")
         self._alpaca_secret = os.getenv("ALPACA_API_SECRET")
@@ -321,6 +328,22 @@ class PositionMonitor:
             atr_14 = pos.get("atr_14")
             reason = None
 
+            # ── HARD STOP-LOSS CHECK (5% Verlust-Limit) ──────────────────────
+            if entry > 0:
+                if direction == "long":
+                    loss_pct = (entry - price) / entry
+                    if loss_pct >= self.hard_stop_loss_pct:
+                        reason = "hard_stop_loss"
+                else:  # short
+                    loss_pct = (price - entry) / entry
+                    if loss_pct >= self.hard_stop_loss_pct:
+                        reason = "hard_stop_loss"
+
+            if reason == "hard_stop_loss":
+                result = self.close_position(pid, reason, price)
+                actions.append(result)
+                continue  # Skip weitere Checks für diese Position
+
             # ── Trailing Stop mit adaptivem ATR Multiplikator (Swing Trading) ─
             if atr_14 and float(atr_14) > 0:
                 # For swing trading: use tighter multiplier (1.2x instead of 1.5-3.0x)
@@ -341,25 +364,35 @@ class PositionMonitor:
                     # Calculate trailing SL (tight for swing trading)
                     trailing_sl = highest - (trailing_mult * float(atr_14))
 
-                    # ── AGGRESSIVE Profit Lock-In (Swing Trading) ──────────────
+                    # ── AGGRESSIVE Profit Lock-In with Ratchet (Swing Trading) ─────
                     profit_pct = (price - entry) / entry if entry > 0 else 0
-
-                    # Use highest_price as peak (updated throughout position life)
                     peak_price = highest
 
-                    if profit_pct >= 0.10:  # +10% profit → lock at +5%
-                        trailing_sl = max(trailing_sl, entry * 1.05)
-                    elif profit_pct >= 0.05:  # +5% profit → lock at +2%
-                        trailing_sl = max(trailing_sl, entry * 1.02)
-                    elif profit_pct >= 0.02:  # +2% profit → lock at breakeven
-                        trailing_sl = max(trailing_sl, entry * 1.00)
+                    # Profit ratchet levels: 10%, 12%, 15%, 18%
+                    profit_lock_levels = [0.10, 0.12, 0.15, 0.18]
+                    highest_locked = float(pos.get("highest_locked_profit_pct") or 0.0)
 
-                    # KEY FEATURE: If price falls below highest peak reached → SELL with profit
-                    # This prevents giving back gains after +2%/+5%/+10% milestones hit
-                    if peak_price > entry and price < (peak_price * 0.99):  # 1% below peak
-                        sl = price + 0.01  # Sell immediately when profit erodes
-                        reason = "profit_peak_reversal"
+                    # Update locked profit levels if new milestone reached
+                    for level in profit_lock_levels:
+                        if profit_pct >= level and level > highest_locked:
+                            highest_locked = level
+                            with _connect() as conn:
+                                conn.execute(
+                                    "UPDATE positions SET highest_locked_profit_pct=? WHERE id=?",
+                                    (highest_locked, pid),
+                                )
+                                conn.commit()
+                            logger.info(
+                                "[PositionMonitor] #%d locked profit at +%.1f%% (%s)",
+                                pid, level*100, symbol
+                            )
+
+                    # KEY FEATURE: Ratchet stop - if profit falls below locked level, close
+                    if highest_locked > 0 and profit_pct < highest_locked:
+                        sl = price + 0.01
+                        reason = "profit_ratchet_breach"
                     else:
+                        trailing_sl = highest - (trailing_mult * float(atr_14))
                         sl = trailing_sl
                         reason = None
                 else:  # short
@@ -377,16 +410,36 @@ class PositionMonitor:
                     # Calculate trailing SL for shorts (tight)
                     trailing_sl = lowest + (trailing_mult * float(atr_14))
 
-                    # ── AGGRESSIVE Profit Lock-In for Shorts ──────────────────
+                    # ── AGGRESSIVE Profit Lock-In with Ratchet for Shorts ─────────
                     profit_pct = (entry - price) / entry if entry > 0 else 0
-                    if profit_pct >= 0.10:  # +10% profit → lock at +5%
-                        trailing_sl = min(trailing_sl, entry * 0.95)
-                    elif profit_pct >= 0.05:  # +5% profit → lock at +2%
-                        trailing_sl = min(trailing_sl, entry * 0.98)
-                    elif profit_pct >= 0.02:  # +2% profit → lock at breakeven
-                        trailing_sl = min(trailing_sl, entry * 1.00)
 
-                    sl = trailing_sl
+                    # Profit ratchet levels: 10%, 12%, 15%, 18%
+                    profit_lock_levels = [0.10, 0.12, 0.15, 0.18]
+                    highest_locked = float(pos.get("highest_locked_profit_pct") or 0.0)
+
+                    # Update locked profit levels if new milestone reached
+                    for level in profit_lock_levels:
+                        if profit_pct >= level and level > highest_locked:
+                            highest_locked = level
+                            with _connect() as conn:
+                                conn.execute(
+                                    "UPDATE positions SET highest_locked_profit_pct=? WHERE id=?",
+                                    (highest_locked, pid),
+                                )
+                                conn.commit()
+                            logger.info(
+                                "[PositionMonitor] #%d locked profit at +%.1f%% (%s)",
+                                pid, level*100, symbol
+                            )
+
+                    # KEY FEATURE: Ratchet stop - if profit falls below locked level, close
+                    if highest_locked > 0 and profit_pct < highest_locked:
+                        sl = price - 0.01
+                        reason = "profit_ratchet_breach"
+                    else:
+                        trailing_sl = lowest + (trailing_mult * float(atr_14))
+                        sl = trailing_sl
+                        reason = None
 
                 # Store adaptive multiplier used
                 with _connect() as conn:

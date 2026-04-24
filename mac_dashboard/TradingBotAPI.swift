@@ -156,13 +156,30 @@ class TradingBotAPI: NSObject, ObservableObject {
         let url = URL(string: "\(baseURL)/api/health")!
         let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
 
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+        print("Testing connection to: \(url.absoluteString)")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
+                if let error = error {
+                    let nsError = error as NSError
+                    let errorMsg = "Error: \(nsError.domain) [\(nsError.code)] - \(error.localizedDescription)"
+                    print(errorMsg)
+                    self?.isConnected = false
+                    self?.errorMessage = errorMsg
+                    return
+                }
+
                 if let httpResponse = response as? HTTPURLResponse {
                     self?.isConnected = (httpResponse.statusCode == 200)
+                    if httpResponse.statusCode == 200 {
+                        print("✓ Connected to API")
+                    } else {
+                        print("API returned status \(httpResponse.statusCode)")
+                        self?.errorMessage = "API returned status \(httpResponse.statusCode)"
+                    }
                 } else {
                     self?.isConnected = false
-                    self?.errorMessage = error?.localizedDescription ?? "Cannot connect"
+                    self?.errorMessage = "No response from API"
                 }
             }
         }.resume()

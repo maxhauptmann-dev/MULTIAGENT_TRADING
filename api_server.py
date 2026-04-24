@@ -71,7 +71,7 @@ def get_positions():
         cursor.execute("""
             SELECT
                 id, symbol, direction, entry_price, quantity, stop_loss, take_profit,
-                opened_at, highest_price, lowest_price, atr_14, kelly_fraction_used
+                opened_at, highest_price, atr_14, highest_locked_profit_pct
             FROM positions
             WHERE status = 'open'
             ORDER BY opened_at DESC
@@ -98,6 +98,11 @@ def get_positions():
                 pnl_dollar = (entry - current_price) * qty
                 pnl_pct = ((entry - current_price) / entry * 100) if entry > 0 else 0
 
+            highest_locked = float(row["highest_locked_profit_pct"]) if row["highest_locked_profit_pct"] else None
+
+            # Calculate hard stop loss (-5%) if not explicitly set
+            hard_sl = entry * 0.95 if entry > 0 else None
+
             positions.append({
                 "symbol": symbol,
                 "direction": direction,
@@ -108,11 +113,11 @@ def get_positions():
                 "pnl_percent": round(pnl_pct, 2),
                 "stop_loss": float(row["stop_loss"]) if row["stop_loss"] else None,
                 "take_profit": float(row["take_profit"]) if row["take_profit"] else None,
+                "hard_stop_loss": round(hard_sl, 2) if hard_sl else None,
                 "opened_at": row["opened_at"],
                 "highest_price": float(row["highest_price"]) if row["highest_price"] else current_price,
-                "lowest_price": float(row["lowest_price"]) if row["lowest_price"] else current_price,
                 "atr_14": float(row["atr_14"]) if row["atr_14"] else None,
-                "kelly_fraction": float(row["kelly_fraction_used"]) if row["kelly_fraction_used"] else None,
+                "highest_locked_profit_pct": round(highest_locked * 100, 1) if highest_locked else None,
             })
 
         return jsonify(_json_response({"positions": positions}))

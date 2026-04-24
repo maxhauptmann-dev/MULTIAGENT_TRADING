@@ -1,0 +1,2 @@
+vncserver -kill :1 2>/dev/null
+vncserver -geometry 1920x1200 -depth 24 :1
