@@ -600,7 +600,26 @@ class ExecutionAgent:
                 )
                 logger.info(f"[ExecutionAgent] Kelly sizing: {kelly_qty} shares (down from {validation['qty']})")
 
-        # 3) Correlation Filter (only for opening new positions)
+        # 3) Hard Position Size Cap (Max 5% per position for swing trading)
+        if trade_plan.get("action") == "open_position" and entry_price and entry_price > 0:
+            max_position_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.05"))  # 5%
+            max_position_value = account_size * max_position_pct
+            position_value = qty * entry_price
+            if position_value > max_position_value:
+                old_qty = qty
+                qty = int(max_position_value / entry_price)
+                self._log_risk_decision(
+                    symbol, "position_size_cap",
+                    f"Position value ${position_value:.0f} > max ${max_position_value:.0f}",
+                    "MODIFIED"
+                )
+                logger.warning(
+                    "[RiskGuard] POSITION SIZE CAP: %d shares (%.1f%% of account) → %d shares (%.1f%% of account)",
+                    old_qty, (old_qty * entry_price / account_size * 100),
+                    qty, (qty * entry_price / account_size * 100)
+                )
+
+        # 4) Correlation Filter (only for opening new positions)
         if trade_plan.get("action") == "open_position":
             corr_check = self._check_correlation_with_positions(symbol)
             if corr_check["action"] == "REJECT":
@@ -714,13 +733,30 @@ def run_single_symbol_mode(
     6. Optional: Execution-Agent → Order-API.
     """
 
-    # Early check: skip if position already open (before expensive data/agent calls)
+    # ── RISK GUARD: Duplikat-Check + Position Limits ────────────────────────
     if _pm_module.monitor:
         open_pos = _pm_module.monitor.get_open_positions()
+
+        # 1) DUPLIKAT CHECK: Symbol already open?
         if any(p.get("symbol") == symbol for p in open_pos):
+            logger.warning("[RiskGuard] DUPLICATE: %s already has open position. Skipping.", symbol)
             return {
                 "symbol": symbol,
                 "trade_plan": {"action": "no_trade", "reason": "position_already_open"},
+                "signal_output": None,
+                "market_meta": {},
+            }
+
+        # 2) MAX POSITION COUNT: Limit to 15 for swing trading
+        max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+        if len(open_pos) >= max_positions:
+            logger.warning("[RiskGuard] MAX POSITIONS REACHED: %d open. Rejecting new trade.", len(open_pos))
+            return {
+                "symbol": symbol,
+                "trade_plan": {
+                    "action": "no_trade",
+                    "reason": f"max_positions_reached_{len(open_pos)}_of_{max_positions}",
+                },
                 "signal_output": None,
                 "market_meta": {},
             }

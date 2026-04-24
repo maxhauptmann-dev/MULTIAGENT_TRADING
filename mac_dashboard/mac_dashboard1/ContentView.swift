@@ -159,7 +159,7 @@ struct PortfolioStatsView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            StatCard(label: "Open Positions", value: String(positions.count))
+            StatCard(label: "Open Positions", value: String(positions.count), color: nil)
             StatCard(label: "Total P&L", value: String(format: "$%.2f", totalPnL), color: totalPnL >= 0 ? .green : .red)
             StatCard(label: "Avg P&L %", value: String(format: "%.2f%%", totalPnLPercent), color: totalPnLPercent >= 0 ? .green : .red)
         }

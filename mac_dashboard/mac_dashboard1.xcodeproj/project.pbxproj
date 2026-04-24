@@ -29,9 +29,22 @@
 		50A1A7DE2F9BDA8F00640E6D /* mac_dashboard1UITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = mac_dashboard1UITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		50A1A80E2F9BDC9800640E6D /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				"mac-dashboard1-Info.plist",
+			);
+			target = 50A1A7C62F9BDA8E00640E6D /* mac_dashboard1 */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		50A1A7C92F9BDA8E00640E6D /* mac_dashboard1 */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				50A1A80E2F9BDC9800640E6D /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */,
+			);
 			path = mac_dashboard1;
 			sourceTree = "<group>";
 		};
@@ -399,6 +412,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "mac-dashboard1-Info.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -429,6 +443,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "mac-dashboard1-Info.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

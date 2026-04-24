@@ -1,5 +1,7 @@
 import Foundation
-
+import Foundation
+import SwiftUI
+import Combine
 // MARK: - Data Models
 
 struct APIResponse<T: Codable>: Codable {

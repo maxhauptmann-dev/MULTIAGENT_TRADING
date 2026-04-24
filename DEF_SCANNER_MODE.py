@@ -53,13 +53,30 @@ def _process_symbol(
     if market_regime is None:
         market_regime = {}
     try:
-        # Early check: skip if position already open (before expensive data/agent calls)
+        # ── RISK GUARD: Duplikat-Check + Position Limits ────────────────────────
         if _pm_module.monitor:
             open_pos = _pm_module.monitor.get_open_positions()
+
+            # 1) DUPLIKAT CHECK: Symbol already open?
             if any(p.get("symbol") == symbol for p in open_pos):
+                print(f"[Scanner] DUPLICATE: {symbol} already has open position. Skipping.")
                 return {
                     "symbol": symbol,
                     "trade_plan": {"action": "no_trade", "reason": "position_already_open"},
+                    "signal_output": None,
+                    "synthese_output": None,
+                }
+
+            # 2) MAX POSITION COUNT: Limit to 15 for swing trading
+            max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+            if len(open_pos) >= max_positions:
+                print(f"[Scanner] MAX POSITIONS REACHED: {len(open_pos)} open (limit: {max_positions}). Skipping {symbol}.")
+                return {
+                    "symbol": symbol,
+                    "trade_plan": {
+                        "action": "no_trade",
+                        "reason": f"max_positions_reached_{len(open_pos)}_of_{max_positions}",
+                    },
                     "signal_output": None,
                     "synthese_output": None,
                 }
@@ -219,6 +236,18 @@ def _process_symbol(
             # Apply sentiment gate size reduction/increase
             if size_reduction_factor != 1.0:
                 sizing["qty"] = max(1, int(sizing.get("qty", 0) * size_reduction_factor))
+
+            # ── POSITION SIZE CAP (Max 5% per position for swing trading) ──
+            qty = sizing.get("qty", 0)
+            if qty > 0 and last_close > 0:
+                max_position_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.05"))  # 5%
+                max_position_value = acct_size * max_position_pct
+                position_value = qty * last_close
+                if position_value > max_position_value:
+                    old_qty = qty
+                    qty = max(1, int(max_position_value / last_close))
+                    sizing["qty"] = qty
+                    print(f"[Scanner] POSITION SIZE CAP: {symbol} {old_qty} shares (${position_value:.0f}) → {qty} shares (${position_value * qty / old_qty:.0f})")
 
             if sizing.get("qty", 0) == 0:
                 trade_plan["action"] = "no_trade"
