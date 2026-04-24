@@ -714,6 +714,17 @@ def run_single_symbol_mode(
     6. Optional: Execution-Agent → Order-API.
     """
 
+    # Early check: skip if position already open (before expensive data/agent calls)
+    if _pm_module.monitor:
+        open_pos = _pm_module.monitor.get_open_positions()
+        if any(p.get("symbol") == symbol for p in open_pos):
+            return {
+                "symbol": symbol,
+                "trade_plan": {"action": "no_trade", "reason": "position_already_open"},
+                "signal_output": None,
+                "market_meta": {},
+            }
+
     if _data_agent is None:
         raise RuntimeError(
             "DataAgent ist nicht verfügbar (ibapi fehlt). Bitte `pip install ibapi` und DEF_DATA_AGENT aktivieren."
