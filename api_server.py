@@ -318,6 +318,7 @@ def health():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info(f"Starting Trading API on 0.0.0.0:{API_PORT}")
+    logger.info(f"Starting Trading API on 0.0.0.0:{API_PORT} (HTTP)")
     logger.info(f"Database: {DB_PATH}")
+
     app.run(host="0.0.0.0", port=API_PORT, debug=False, threaded=True)
