@@ -406,6 +406,146 @@ class ExecutionAgent:
             },
         )
 
+    def _build_option_symbol(self, underlying: str, expiry_date, option_type: str, strike: float) -> str:
+        """Baut OCC Options-Symbol: z.B. AAPL260517C00200000"""
+        if isinstance(expiry_date, str):
+            expiry_date = datetime.fromisoformat(expiry_date).date()
+        date_str = expiry_date.strftime("%y%m%d")
+        type_char = "C" if option_type.lower() == "call" else "P"
+        strike_str = f"{int(strike * 1000):08d}"
+        return f"{underlying.upper()}{date_str}{type_char}{strike_str}"
+
+    def fetch_best_option_contract(
+        self,
+        symbol: str,
+        option_type: str,
+        dte_min: int,
+        dte_max: int,
+        delta_target: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Holt beste Options-Kontrakt von Alpaca via GET /v2/options/contracts.
+        Wählt Contract mit Delta am nächsten zu delta_target.
+        """
+        from datetime import date, timedelta
+
+        api_key = CONFIG["alpaca"]["api_key"]
+        api_secret = CONFIG["alpaca"]["api_secret"]
+        _assert_env("ALPACA_API_KEY", api_key)
+        _assert_env("ALPACA_API_SECRET", api_secret)
+
+        base = CONFIG["alpaca"]["base_url"]
+        today = date.today()
+        exp_gte = (today + timedelta(days=dte_min)).isoformat()
+        exp_lte = (today + timedelta(days=dte_max)).isoformat()
+
+        url = f"{base}/v2/options/contracts"
+        try:
+            resp = http_get(
+                url,
+                params={
+                    "underlying_symbol": symbol,
+                    "type": option_type.lower(),
+                    "expiration_date_gte": exp_gte,
+                    "expiration_date_lte": exp_lte,
+                    "status": "active",
+                    "limit": 100,
+                },
+                headers={
+                    "APCA-API-KEY-ID": api_key,
+                    "APCA-API-SECRET-KEY": api_secret,
+                },
+            )
+            if not resp or resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            contracts = data.get("option_contracts", [])
+            if not contracts:
+                return None
+
+            # Wähle Contract mit Delta am nächsten zu target
+            best = None
+            best_delta_diff = float("inf")
+
+            for c in contracts:
+                greeks = c.get("greeks") or {}
+                delta = greeks.get("delta")
+
+                if delta is None:
+                    continue
+
+                diff = abs(float(delta) - delta_target)
+                if diff < best_delta_diff:
+                    best_delta_diff = diff
+                    best = c
+
+            # Fallback: wenn kein Greeks verfügbar, nimm mittleren Strike
+            if best is None and contracts:
+                mid = len(contracts) // 2
+                best = contracts[mid]
+
+            if best is None:
+                return None
+
+            expiry = best.get("expiration_date")
+            strike = float(best.get("strike_price", 0))
+            occ_symbol = best.get("symbol")
+
+            if not occ_symbol or strike == 0:
+                return None
+
+            dte = (date.fromisoformat(expiry) - today).days if expiry else dte_min
+
+            return {
+                "occ_symbol": occ_symbol,
+                "strike": strike,
+                "expiry": expiry,
+                "delta": float(best.get("greeks", {}).get("delta", delta_target)),
+                "dte": dte,
+                "underlying": symbol,
+                "option_type": option_type,
+            }
+        except Exception as exc:
+            logger.warning("[ExecutionAgent] Contract lookup failed for %s: %s", symbol, exc)
+            return None
+
+    def place_alpaca_options_order(
+        self,
+        option_symbol: str,
+        side: str,
+        qty: int,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+    ) -> Any:
+        """Platziert Options-Order via Alpaca API (nutzt OCC Symbol Format)."""
+        api_key = CONFIG["alpaca"]["api_key"]
+        api_secret = CONFIG["alpaca"]["api_secret"]
+        _assert_env("ALPACA_API_KEY", api_key)
+        _assert_env("ALPACA_API_SECRET", api_secret)
+
+        base = CONFIG["alpaca"]["base_url"]
+        url = f"{base}/v2/orders"
+        normalized_type = self._normalize_alpaca_order_type(order_type)
+        body = {
+            "symbol": option_symbol,  # OCC Format: AAPL260517C00200000
+            "side": side.lower(),
+            "type": normalized_type,
+            "qty": qty,
+            "time_in_force": "day",
+        }
+        if normalized_type in {"limit", "stop_limit"} and limit_price is not None:
+            body["limit_price"] = limit_price
+
+        return http_post(
+            url,
+            body,
+            headers={
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+            },
+        )
+
     def place_tradier_order(
         self,
         symbol: str,
@@ -551,7 +691,7 @@ class ExecutionAgent:
         entry_price = trade_plan.get("entry", {}).get("trigger_price")
         stop_price = trade_plan.get("stop_loss", {}).get("price")
 
-        preferred = (broker_preference or trade_plan.get("broker")) or "ibkr"
+        preferred = (broker_preference or trade_plan.get("broker")) or "alpaca"
         preferred = preferred.lower()
 
         # Simulation-Short-Circuit
@@ -634,6 +774,41 @@ class ExecutionAgent:
         qty, cap_info = self._cap_quantity(qty)
         if cap_info:
             validation["sizing"].update(cap_info)
+
+        # ── OPTIONS-EXECUTION BRANCH ──────────────────────────────────────
+        if instrument_type == "option":
+            auto_execute_options = os.getenv("OPTIONS_AUTO_EXECUTE", "0") == "1"
+            if not auto_execute_options:
+                self._log_risk_decision(symbol, "options_review_mode", "auto_execute_disabled", "REVIEW")
+                return {"status": "review", "instrument": "option", "reason": "auto_execute_disabled"}
+
+            options_plan = trade_plan.get("options_plan", {})
+            opt_type = options_plan.get("type", "call")
+            dte_min = options_plan.get("dte_target", {}).get("min", 20)
+            dte_max = options_plan.get("dte_target", {}).get("max", 45)
+            delta_target = options_plan.get("delta_target", 0.5)
+            contracts_count = options_plan.get("contracts", qty)
+
+            contract = self.fetch_best_option_contract(symbol, opt_type, dte_min, dte_max, delta_target)
+            if not contract:
+                self._log_risk_decision(symbol, "options_no_contract", f"type={opt_type}", "REJECT")
+                return {"status": "error", "reason": "no_contract_found", "instrument": "option"}
+
+            occ_symbol = contract["occ_symbol"]
+            try:
+                result = self.place_alpaca_options_order(occ_symbol, side, contracts_count)
+                self._log_risk_decision(symbol, "execution_options", f"contracts={contracts_count}, strike={contract['strike']}", "SENT")
+
+                # Register in options_monitor if available
+                import position_monitor as _pm
+                if _pm.options_monitor:
+                    _pm.options_monitor.open_option(options_plan, contract, contracts_count)
+
+                return {"status": "sent", "broker": "alpaca_options", "contract": contract, "raw": result}
+            except Exception as exc:
+                logger.exception("Options execution error: %s", exc)
+                self._log_risk_decision(symbol, "options_execution_error", str(exc), "ERROR")
+                return {"status": "error", "reason": str(exc), "instrument": "option"}
 
         try:
             if instrument_type in {"fx", "forex"}:

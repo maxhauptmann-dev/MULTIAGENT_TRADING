@@ -14,7 +14,7 @@ Konfiguration via .env:
   SCHEDULER_FLATTEN_INTRADAY 0           1 = Positionen vor Schluss schließen
   ACCOUNT_SIZE               100000
   MAX_RISK_PER_TRADE         0.01
-  BROKER_PREFERENCE          ibkr
+  BROKER_PREFERENCE          alpaca
 
 Starten:
   python scheduler.py
@@ -70,12 +70,19 @@ TIMEFRAME = os.getenv("SCHEDULER_TIMEFRAME", "1D")
 AUTO_EXECUTE = os.getenv("SCHEDULER_AUTO_EXECUTE", "0") == "1"
 FLATTEN_INTRADAY = os.getenv("SCHEDULER_FLATTEN_INTRADAY", "0") == "1"
 
+# Options Trading (separate, independent)
+OPTIONS_ENABLED = os.getenv("OPTIONS_ENABLED", "0") == "1"
+OPTIONS_AUTO_EXECUTE = os.getenv("OPTIONS_AUTO_EXECUTE", "0") == "1"
+OPTIONS_24_7 = os.getenv("OPTIONS_24_7", "0") == "1"
+OPTIONS_SCAN_HOUR = int(os.getenv("OPTIONS_SCAN_HOUR", "9"))
+OPTIONS_SCAN_MINUTE = int(os.getenv("OPTIONS_SCAN_MINUTE", "45"))
+
 
 def _build_account_info() -> dict:
     return {
         "account_size": float(os.getenv("ACCOUNT_SIZE", "100000")),
         "max_risk_per_trade": float(os.getenv("MAX_RISK_PER_TRADE", "0.01")),
-        "broker_preference": os.getenv("BROKER_PREFERENCE", "ibkr"),
+        "broker_preference": os.getenv("BROKER_PREFERENCE", "alpaca"),
     }
 
 
@@ -206,6 +213,44 @@ def job_backtest() -> None:
     logger.info("[Job] Backtest abgeschlossen. Report: %s", report_file)
 
 
+def job_options_scan() -> None:
+    """Separater Options-Scanner (läuft unabhängig vom Aktien-Scanner)."""
+    from DEF_OPTIONS_SCANNER_MODE import run_options_scanner_mode
+    from universe_manager import manager as universe_manager
+
+    logger.info("[Job] Options-Scan startet – Universen=%s", UNIVERSES)
+
+    try:
+        watchlist = universe_manager.get(*UNIVERSES)
+    except Exception as exc:
+        logger.error("[Job] Universum laden fehlgeschlagen: %s", exc)
+        return
+
+    if not watchlist:
+        logger.warning("[Job] Watchlist leer – Options-Scan abgebrochen.")
+        return
+
+    account_info = _build_account_info()
+    logger.info("[Job] %d Symbole | auto_execute=%s", len(watchlist), OPTIONS_AUTO_EXECUTE)
+
+    try:
+        result = run_options_scanner_mode(
+            watchlist=watchlist,
+            account_info=account_info,
+            timeframe=TIMEFRAME,
+            market_hint="US",
+            auto_execute=OPTIONS_AUTO_EXECUTE,
+        )
+        logger.info("[Job] Options-Scan abgeschlossen: %d Setups gescannt", len(result.get("setups", [])))
+
+        if _pm_module.options_monitor:
+            with __import__("sqlite3").connect(os.getenv("POSITION_DB_PATH", "positions.db")) as conn:
+                open_opts = conn.execute("SELECT COUNT(*) FROM options_positions WHERE status='open'").fetchone()[0]
+                logger.info("[Job] Options-Statistik: %d offene Optionen", open_opts)
+    except Exception as exc:
+        logger.error("[Job] Options-Scanner-Fehler: %s", exc, exc_info=True)
+
+
 # ── TradingScheduler ──────────────────────────────────────────────────────────
 
 class TradingScheduler:
@@ -293,15 +338,49 @@ class TradingScheduler:
             )
             logger.info("Job: Backtest @ %02d:%02d UTC (Mo-Fr)", backtest_hour, backtest_minute)
 
+        # Options-Scanner Job (separat, unabhängig)
+        if OPTIONS_ENABLED:
+            if OPTIONS_24_7:
+                # Jede Stunde
+                trigger = CronTrigger(hour="*", minute="5", timezone="UTC")
+                logger.info("Job: Options Scanner @ every hour:05 UTC (24/7)")
+            else:
+                # Mo-Fr um spezifische Zeit
+                trigger = CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=OPTIONS_SCAN_HOUR,
+                    minute=OPTIONS_SCAN_MINUTE,
+                    timezone="America/New_York",
+                )
+                logger.info(
+                    "Job: Options Scanner @ %02d:%02d ET (Mo-Fr)",
+                    OPTIONS_SCAN_HOUR,
+                    OPTIONS_SCAN_MINUTE,
+                )
+
+            self._sched.add_job(
+                job_options_scan,
+                trigger=trigger,
+                id="options_scanner",
+                name="Options Scanner",
+                replace_existing=True,
+                misfire_grace_time=300,
+            )
+
     def start(self) -> None:
         _, _, _, _pm = _lazy_imports()
         if _pm.monitor:
             _pm.monitor.start()
             logger.info("Position-Monitor gestartet.")
 
+        if OPTIONS_ENABLED:
+            if _pm.options_monitor:
+                _pm.options_monitor.start()
+                logger.info("Options-Monitor gestartet.")
+
         logger.info(
-            "Scheduler läuft. Märkte=%s | Universen=%s | Auto-Execute=%s | Flatten=%s",
-            MARKETS, UNIVERSES, AUTO_EXECUTE, FLATTEN_INTRADAY,
+            "Scheduler läuft. Märkte=%s | Universen=%s | Auto-Execute=%s | Flatten=%s | Options=%s",
+            MARKETS, UNIVERSES, AUTO_EXECUTE, FLATTEN_INTRADAY, OPTIONS_ENABLED,
         )
         self._sched.start()  # blockiert bis stop()
 
@@ -310,6 +389,8 @@ class TradingScheduler:
         _, _, _, _pm = _lazy_imports()
         if _pm.monitor:
             _pm.monitor.stop()
+        if OPTIONS_ENABLED and _pm.options_monitor:
+            _pm.options_monitor.stop()
         self._sched.shutdown(wait=False)
         logger.info("Scheduler gestoppt.")
 
