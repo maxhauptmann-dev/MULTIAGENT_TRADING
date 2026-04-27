@@ -164,17 +164,17 @@ def _process_symbol(
             "intermarket_output":  intermarket_output,
             "news_output":         news_output,
         }
-        synthese_output = safe_call_gpt_agent("synthese_agent", synth_input)
+        synthese_output = safe_call_gpt_agent("synthese_agent", synth_input) or {"error": "no_result"}
 
         # Signal — ML zuerst, GPT als Fallback
         from DEF_ML_SIGNAL import _engine as _ml_engine
         if _ml_engine.is_loaded and candles:
-            signal_output = _ml_engine.predict(candles, symbol=symbol)
+            signal_output = _ml_engine.predict(candles, symbol=symbol) or {"error": "ml_prediction_failed"}
         else:
             signal_output = safe_call_gpt_agent(
                 "signal_scanner_agent",
                 {"symbol": symbol, "synthese_output": synthese_output},
-            )
+            ) or {"error": "no_result"}
 
         # Handels-Plan – mit Market-Regime Gate
         handels_input = {
@@ -199,7 +199,7 @@ def _process_symbol(
             size_reduction_factor = 1.2
             handels_input["sentiment_gate_bonus"] = "negative_sentiment_aligned_with_bear"
 
-        trade_plan = safe_call_gpt_agent("handels_agent", handels_input)
+        trade_plan = safe_call_gpt_agent("handels_agent", handels_input) or {"action": "no_trade", "reason": "agent_failed"}
 
         # CircuitBreaker
         if not _scanner_cb.allow():
@@ -237,10 +237,10 @@ def _process_symbol(
             if size_reduction_factor != 1.0:
                 sizing["qty"] = max(1, int(sizing.get("qty", 0) * size_reduction_factor))
 
-            # ── POSITION SIZE CAP (Max 5% per position for swing trading) ──
+            # ── POSITION SIZE CAP (Max 2% per position per DEFAULT) ──
             qty = sizing.get("qty", 0)
             if qty > 0 and last_close > 0:
-                max_position_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.05"))  # 5%
+                max_position_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.02"))  # 2% DEFAULT (=2k$ bei 100k account)
                 max_position_value = acct_size * max_position_pct
                 position_value = qty * last_close
                 if position_value > max_position_value:
