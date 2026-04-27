@@ -119,6 +119,8 @@ class OptionsAgent:
     # ------------------------------------------------------------------
 
     def _score_trend(self, direction: str, synth: Dict[str, Any]) -> float:
+        if not synth:
+            return 0.5
         bias = synth.get("overall_bias")
         conf = synth.get("overall_confidence") or 0.0
 
@@ -136,6 +138,8 @@ class OptionsAgent:
         return float(conf) * 0.25
 
     def _score_entry(self, signal: Dict[str, Any]) -> float:
+        if not signal:
+            return 0.5
         conf = signal.get("confidence") or 0.0
         style = signal.get("entry_style") or "none"
 
@@ -154,6 +158,8 @@ class OptionsAgent:
         - für LONG: positive News gut
         - für SHORT: negative News gut
         """
+        if not news:
+            return 0.5  # neutral
         sent = news.get("overall_sentiment")
         if sent is None:
             return 0.5  # neutral
@@ -179,6 +185,8 @@ class OptionsAgent:
         Approximation über volatility_level aus synthese_output,
         bis echte IV-Daten angebunden sind.
         """
+        if not synth:
+            return self.config.default_iv_score
         vol = (synth.get("volatility_level") or "").lower()
 
         # Für Optionskäufe ist zu hohe Volatilität (oft = hohe IV) eher schlecht.
@@ -235,11 +243,11 @@ class OptionsAgent:
         signal: Dict[str, Any],
         news: Dict[str, Any],
     ) -> str:
-        bias = synth.get("overall_bias")
-        bias_conf = synth.get("overall_confidence")
-        sig = signal.get("short_term_signal")
-        style = signal.get("entry_style")
-        sent = news.get("overall_sentiment")
+        bias = (synth or {}).get("overall_bias", "unknown")
+        bias_conf = (synth or {}).get("overall_confidence", "n/a")
+        sig = (signal or {}).get("short_term_signal", "unknown")
+        style = (signal or {}).get("entry_style", "n/a")
+        sent = (news or {}).get("overall_sentiment", "n/a")
 
         return (
             f"{option_type.upper()}-Setup basierend auf "
