@@ -179,8 +179,8 @@ class PositionMonitor:
         self.check_interval = check_interval_seconds
         self.hard_stop_loss_pct = hard_stop_loss_pct  # 5% default hard stop
         self._finnhub_key = os.getenv("FINNHUB_API_KEY")
-        self._alpaca_key = os.getenv("ALPACA_API_KEY")
-        self._alpaca_secret = os.getenv("ALPACA_API_SECRET")
+        self._alpaca_key = os.getenv("APCA_API_KEY_ID")
+        self._alpaca_secret = os.getenv("APCA_API_SECRET_KEY")
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         _init_db()
