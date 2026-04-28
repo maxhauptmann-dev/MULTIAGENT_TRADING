@@ -408,7 +408,7 @@ def run_scanner_mode(
     """
     Modus B – Scanner (parallel):
     Verarbeitet Symbole gleichzeitig in max_workers Threads.
-    Fetches market regime once at start and applies to all symbols.
+    OPTIMIERT: TOP 5 Filter + Dynamische Position-Sizing nach Rank
     """
     workers = max_workers or _SCANNER_MAX_WORKERS
     workers = max(1, min(workers, len(watchlist)))
@@ -436,7 +436,60 @@ def run_scanner_mode(
             if result is not None:
                 setups.append(result)
 
-    return {"setups": setups}
+    # ══════════════════════════════════════════════════════════════════════
+    # TOP 5 FILTER + DYNAMIC POSITION SIZING
+    # ══════════════════════════════════════════════════════════════════════
+
+    # Only keep setups with valid trade plans
+    valid_setups = [s for s in setups if isinstance(s.get("trade_plan"), dict) and s["trade_plan"].get("action") == "open_position"]
+
+    if valid_setups:
+        # Score each setup by confidence (primary) + signal strength
+        def _score_setup(setup: Dict[str, Any]) -> float:
+            trade_plan = setup.get("trade_plan", {})
+            signal_output = setup.get("signal_output", {})
+            synthese_output = setup.get("synthese_output", {})
+
+            sig_conf = float(signal_output.get("confidence", 0)) if isinstance(signal_output, dict) else 0.0
+            synth_conf = float(synthese_output.get("overall_confidence", 0)) if isinstance(synthese_output, dict) else 0.0
+            rr_ratio = float(trade_plan.get("take_profit", {}).get("reward_risk_ratio", 1.0)) if isinstance(trade_plan.get("take_profit"), dict) else 1.0
+
+            # Composite score: 60% signal confidence + 30% synthese + 10% RR quality
+            score = (sig_conf * 0.60) + (synth_conf * 0.30) + (min(rr_ratio, 3.0) / 3.0 * 0.10)
+            return score
+
+        # Sort by score descending
+        valid_setups.sort(key=_score_setup, reverse=True)
+
+        # Keep only TOP 5
+        max_daily_trades = int(os.getenv("MAX_DAILY_TRADES", "5"))
+        top_setups = valid_setups[:max_daily_trades]
+
+        # Adjust position sizing by rank (TOP 1 = 5%, TOP 5 = 1%)
+        for rank, setup in enumerate(top_setups, 1):
+            trade_plan = setup.get("trade_plan", {})
+            if trade_plan.get("action") == "open_position":
+                position_sizing = trade_plan.get("position_sizing", {})
+                old_qty = position_sizing.get("contracts_or_shares", 0)
+
+                # Size based on rank: Rank 1=5%, Rank 2=4%, ... Rank 5=1%
+                size_pct = max(0.01, 0.06 - (rank * 0.01))
+                last_close = setup.get("signal_output", {}).get("market_data", {}).get("price", 100) if isinstance(setup.get("signal_output"), dict) else 100
+                max_account_value = account_info.get("account_size", 100000) * size_pct
+                new_qty = max(1, int(max_account_value / max(1, last_close)))
+
+                if old_qty != new_qty:
+                    position_sizing["contracts_or_shares"] = new_qty
+                    position_sizing["original_qty"] = old_qty
+                    position_sizing["sized_for_rank"] = rank
+                    print(f"[Scanner] TOP {rank}: {setup['symbol']} resized {old_qty} → {new_qty} ({size_pct*100:.0f}% of account)")
+
+                setup["trade_plan"] = trade_plan
+
+        print(f"[Scanner] TOP 5 SELECTED: {len(top_setups)} from {len(valid_setups)} valid setups")
+        return {"setups": top_setups}
+
+    return {"setups": valid_setups}
 
 
 if __name__ == "__main__":

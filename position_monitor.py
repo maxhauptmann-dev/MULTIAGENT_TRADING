@@ -563,6 +563,80 @@ class PositionMonitor:
                 except Exception as e:
                     logger.warning(f"[Correlation Hedge] Fehler: {e}")
 
+    def daily_rebalance_worst_performer(self) -> Optional[Dict[str, Any]]:
+        """
+        DAILY REBALANCING: Schließt die worst-performing offene Position (größter Verlust %)
+        um Kapital für bessere Setups freizumachen.
+
+        Wird 1x täglich aufgerufen, um Portfolio-Qualität zu verbessern.
+        Konzept: "Sell the loser, wait for the winner"
+        """
+        with _connect() as conn:
+            open_positions = conn.execute("""
+                SELECT id, symbol, direction, entry_price, quantity FROM positions WHERE status='open'
+            """).fetchall()
+
+        if not open_positions or len(open_positions) <= 1:
+            # Brauche mindestens 2 offene Positionen zum Rebalancieren
+            return None
+
+        # Berechne P&L % für jede Position
+        positions_with_pnl = []
+        for pid, symbol, direction, entry, qty in open_positions:
+            current_price = self._get_price(symbol)
+            if not current_price or entry <= 0:
+                continue
+
+            if direction == "long":
+                pnl_pct = (current_price - entry) / entry
+            else:  # short
+                pnl_pct = (entry - current_price) / entry
+
+            positions_with_pnl.append({
+                "id": pid,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": entry,
+                "qty": qty,
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "pnl_dollar": pnl_pct * entry * qty
+            })
+
+        if not positions_with_pnl:
+            return None
+
+        # Finde worst performer (größter Verlust %)
+        worst = min(positions_with_pnl, key=lambda x: x["pnl_pct"])
+
+        # Nur schließen wenn wirklich ein Verlust besteht (nicht profitable Positionen)
+        if worst["pnl_pct"] >= 0:
+            logger.info("[DailyRebalance] Alle Positionen profitable – kein Rebalancing nötig")
+            return None
+
+        worst_id = worst["id"]
+        worst_symbol = worst["symbol"]
+        worst_loss_pct = worst["pnl_pct"]
+        worst_qty = worst["qty"]
+        worst_price = worst["current_price"]
+
+        logger.warning(
+            "[DailyRebalance] WORST PERFORMER: #%d %s | Loss: %+.2f%% | Entry: $%.2f → Current: $%.2f",
+            worst_id, worst_symbol, worst_loss_pct * 100, worst["entry_price"], worst_price
+        )
+
+        # Schließe Position
+        result = self.close_position(worst_id, "daily_rebalance_worst", worst_price)
+
+        if result.get("status") == "closed":
+            position_events_logger.warning(
+                f"DAILY_REBALANCE | Closed worst performer #{worst_id} {worst_symbol} | "
+                f"Loss: {worst_loss_pct*100:+.2f}% (${worst['pnl_dollar']:+.2f}) | "
+                f"Freeing capital for better setups"
+            )
+
+        return result
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def open_position(
@@ -746,22 +820,39 @@ class PositionMonitor:
             entry = float(pos.get("entry_price") or 0.0)
             tp = pos.get("take_profit")
             atr_14 = pos.get("atr_14")
+            qty = float(pos.get("quantity") or 0.0)
             reason = None
 
-            # ── HARD STOP-LOSS CHECK (5% Verlust-Limit) ──────────────────────
+            # ── AGGRESSIVE STOP-LOSS: Large positions (>3% account) use -2% instead of -5% ──
+            account_size = float(os.getenv("ACCOUNT_SIZE", "100000"))
+            position_value = qty * price if price > 0 else 0
+            position_pct = (position_value / account_size) if account_size > 0 else 0
+
+            # Use aggressive 2% SL for large positions, default 5% for others
+            effective_sl_pct = 0.02 if position_pct > 0.03 else self.hard_stop_loss_pct
+
+            # Log if aggressive SL applies
+            if position_pct > 0.03 and effective_sl_pct == 0.02:
+                logger.debug(f"[PositionMonitor] #{pid} {symbol}: Large position ({position_pct*100:.1f}% of account) → using aggressive -2% SL")
+
+            # ── HARD STOP-LOSS CHECK (5% default, 2% für große Positionen) ─────
             if entry > 0:
                 if direction == "long":
                     loss_pct = (entry - price) / entry
-                    if loss_pct >= self.hard_stop_loss_pct:
-                        reason = "hard_stop_loss"
+                    if loss_pct >= effective_sl_pct:
+                        reason = "hard_stop_loss_aggressive" if effective_sl_pct == 0.02 else "hard_stop_loss"
                 else:  # short
                     loss_pct = (price - entry) / entry
-                    if loss_pct >= self.hard_stop_loss_pct:
-                        reason = "hard_stop_loss"
+                    if loss_pct >= effective_sl_pct:
+                        reason = "hard_stop_loss_aggressive" if effective_sl_pct == 0.02 else "hard_stop_loss"
 
-            if reason == "hard_stop_loss":
+            if reason and "hard_stop_loss" in reason:
                 result = self.close_position(pid, reason, price)
                 actions.append(result)
+                if effective_sl_pct == 0.02:
+                    position_events_logger.warning(
+                        f"AGGRESSIVE_SL | #{pid} {symbol} | Position: {position_pct*100:.1f}% of account | Loss: {loss_pct*100:.1f}% | Entry: ${entry:.2f} → Exit: ${price:.2f}"
+                    )
                 continue  # Skip weitere Checks für diese Position
 
             # ── Trailing Stop mit adaptivem ATR Multiplikator (Swing Trading) ─
@@ -968,15 +1059,16 @@ class PositionMonitor:
                 if iteration % 15 == 0:
                     self.sync_from_alpaca()
 
-                # Daily rebalancing (sector concentration + correlation hedge + position sizes)
+                # Daily rebalancing (sector concentration + correlation hedge + position sizes + worst performer)
                 today = datetime.now().date()
                 if last_daily_rebalance != today:
                     self.update_correlation_matrix()
-                    self.rebalance_position_sizes()  # NEW: Reduce oversized positions
+                    self.rebalance_position_sizes()  # Reduce oversized positions
                     self.rebalance_sector_concentration()
                     self.check_correlation_hedge()
+                    self.daily_rebalance_worst_performer()  # NEW: Close worst performer to free capital
                     last_daily_rebalance = today
-                    logger.info("[PositionMonitor] Tägliche Rebalance durchgeführt")
+                    logger.info("[PositionMonitor] Tägliche Rebalance durchgeführt (worst performer check inclusive)")
 
                 actions = self.check_positions()
                 if actions:

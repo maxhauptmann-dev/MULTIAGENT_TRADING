@@ -1,10 +1,10 @@
 """
 trading_agents_with_gpt.py
 
-Multi-Agent-Trading-Architektur:
+Multi-Agent-Trading-Architektur (Alpaca-Only Execution):
 
-- DataAgent  → holt Marktdaten von moomoo / IBKR / OANDA / Alpaca / Tradier
-- ExecutionAgent → baut Broker-Orders (IBKR / OANDA / Alpaca / Tradier)
+- DataAgent  → holt Marktdaten von Alpaca / OANDA
+- ExecutionAgent → baut Broker-Orders (Alpaca, mit Fallback auf Tradier)
 - GPT-Agents (über OpenAI API):
     - regime_agent
     - trend_dow_agent
@@ -76,11 +76,6 @@ HTTP_RETRY_TOTAL = int(os.getenv("HTTP_RETRY_TOTAL", "3"))
 # ============================================================
 
 CONFIG = {
-    "ibkr": {
-        # IBKR Client Portal API / Gateway
-        "base_url": os.getenv("IBKR_BASE_URL", "https://localhost:5003/v1/api"),
-        "account_id": os.getenv("IBKR_ACCOUNT_ID"),
-    },
     "oanda": {
         "base_url": os.getenv("OANDA_BASE_URL", "https://api-fxtrade.oanda.com"),
         "api_key": os.getenv("OANDA_API_KEY"),
@@ -178,8 +173,6 @@ class ExecutionAgent:
         # Max qty cap (None = kein Cap)
         max_qty = _as_positive_float(os.getenv("MAX_QTY_CAP", None))
         self.max_qty_cap = max_qty if max_qty > 0 else None
-        self.ibkr_conid_cache: Dict[str, int] = {}
-        self.ibkr_account_id = CONFIG["ibkr"].get("account_id")
         # Instance logger
         self.logger = logger
 
@@ -221,129 +214,7 @@ class ExecutionAgent:
         return "SELL" if (direction or "").lower() == "short" else "BUY"
 
     # ---------- IBKR helpers ----------
-    def _ensure_ibkr_account(self) -> str:
-        if self.ibkr_account_id:
-            return self.ibkr_account_id
-        base = CONFIG["ibkr"]["base_url"]
-        data = http_get(f"{base}/iserver/accounts")
-        accounts = data.get("accounts") if isinstance(data, dict) else data
-        if not accounts:
-            raise RuntimeError("IBKR liefert keine Accounts zurück – Client Portal Session aktiv?")
-        if isinstance(accounts, list):
-            self.ibkr_account_id = accounts[0]
-        elif isinstance(accounts, dict) and accounts.get("accounts"):
-            self.ibkr_account_id = accounts["accounts"][0]
-        else:
-            raise RuntimeError("IBKR Accounts Response unbekanntes Format")
-        return self.ibkr_account_id
-
-    def _ibkr_sec_type(self, instrument_type: str) -> str:
-        mapping = {
-            "stock": "STK",
-            "equity": "STK",
-            "option": "OPT",
-            "options": "OPT",
-            "future": "FUT",
-            "fx": "CASH",
-            "forex": "CASH",
-        }
-        return mapping.get((instrument_type or "stock").lower(), "STK")
-
-    def _ibkr_conid(self, symbol: str, instrument_type: str) -> int:
-        cache_key = f"{symbol}_{instrument_type}"
-        if cache_key in self.ibkr_conid_cache:
-            return self.ibkr_conid_cache[cache_key]
-        base = CONFIG["ibkr"]["base_url"]
-        body = {
-            "symbol": symbol,
-            "name": False,
-            "secType": self._ibkr_sec_type(instrument_type),
-            "exchange": "SMART",
-        }
-        results = http_post(f"{base}/iserver/secdef/search", body)
-        if not results:
-            raise RuntimeError(f"IBKR: kein secdef Ergebnis für {symbol}")
-        first = results[0]
-        conid = int(first.get("conid") or first.get("conidex"))
-        self.ibkr_conid_cache[cache_key] = conid
-        return conid
-
-    def _ibkr_buying_power(self, account_id: str) -> Optional[float]:
-        base = CONFIG["ibkr"]["base_url"]
-        try:
-            summary = http_get(f"{base}/iserver/account/{account_id}/summary")
-            for item in summary.get("accountSummary", []):
-                if item.get("tag") == "BuyingPower":
-                    return float(item.get("value"))
-        except Exception as exc:
-            logger.warning("IBKR Buying Power Check fehlgeschlagen: %s", exc)
-        return None
-
     # ---------- broker calls ----------
-    def _place_ibkr_socket_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        order_type: str = "MKT",
-        limit_price: Optional[float] = None,
-    ) -> Any:
-        """Order über TWS Socket API (ibapi, Port 7497) — kein Client Portal nötig."""
-        from DEF_DATA_AGENT import IBKRApi
-        api = IBKRApi(
-            host=os.getenv("IBKR_SOCKET_HOST", "127.0.0.1"),
-            port=int(os.getenv("IBKR_SOCKET_PORT", "7497")),
-            client_id=8,
-        )
-        return api.place_order(symbol, side, float(quantity), order_type, limit_price)
-
-    def place_ibkr_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        instrument_type: str,
-        order_type: str = "MKT",
-        limit_price: Optional[float] = None,
-    ) -> Any:
-        # Client Portal (REST) versuchen, bei Fehler auf TWS Socket fallback
-        try:
-            account_id = self._ensure_ibkr_account()
-            buying_power = self._ibkr_buying_power(account_id)
-            if buying_power is not None and limit_price is not None:
-                est_cost = float(quantity) * float(limit_price)
-                if est_cost > buying_power:
-                    raise RuntimeError(
-                        f"IBKR Buying Power ({buying_power}) reicht nicht für Order ({est_cost})."
-                    )
-
-            base = CONFIG["ibkr"]["base_url"]
-            conid = self._ibkr_conid(symbol, instrument_type)
-            body = {
-                "orders": [
-                    {
-                        "account": account_id,
-                        "conid": conid,
-                        "orderType": order_type,
-                        "side": side.lower(),
-                        "tif": "DAY",
-                        "quantity": quantity,
-                        "outsideRTH": False,
-                    }
-                ]
-            }
-            if order_type in {"LMT", "LIMIT"} and limit_price is not None:
-                body["orders"][0]["price"] = limit_price
-            return http_post(f"{base}/iserver/account/{account_id}/orders", body)
-
-        except Exception as exc:
-            logger.warning(
-                "[ExecutionAgent] Client Portal nicht erreichbar (%s) – "
-                "verwende TWS Socket (Port %s).",
-                exc, os.getenv("IBKR_SOCKET_PORT", "7497"),
-            )
-            return self._place_ibkr_socket_order(symbol, side, quantity, order_type, limit_price)
-
     def place_oanda_order(self, symbol: str, side: str, units: float) -> Any:
         api_key = CONFIG["oanda"]["api_key"]
         account_id = CONFIG["oanda"]["account_id"]
@@ -826,10 +697,14 @@ class ExecutionAgent:
                 self._log_risk_decision(symbol, "execution_tradier", f"qty={qty}", "SENT")
                 return {"status": "sent", "broker": "tradier", "raw": res}
 
-            # Default IBKR path
-            res = self.place_ibkr_order(symbol, side, qty, instrument_type, order_type, limit_price)
-            self._log_risk_decision(symbol, "execution_ibkr", f"qty={qty}", "SENT")
-            return {"status": "sent", "broker": "ibkr", "raw": res}
+            # Default to Alpaca (not IBKR) — we only use Alpaca
+            if preferred not in {"alpaca", "tradier"}:
+                preferred = "alpaca"
+                logger.warning("[ExecutionAgent] Invalid broker '%s', defaulting to alpaca", preferred)
+
+            res = self.place_alpaca_order(symbol, side, qty, order_type.lower(), limit_price)
+            self._log_risk_decision(symbol, "execution_alpaca", f"qty={qty}", "SENT")
+            return {"status": "sent", "broker": "alpaca", "raw": res}
         except Exception as exc:
             logger.exception("Execution Fehler: %s", exc)
             self._log_risk_decision(symbol, "execution_error", str(exc), "ERROR")
@@ -837,35 +712,7 @@ class ExecutionAgent:
 # ...existing code...
 
 # ============================================================
-# 4. Timeframe Mapping
-# ============================================================
-
-def _map_timeframe_to_ibkr(timeframe: str) -> Tuple[str, int]:
-    """
-    Mappt dein Timeframe (z.B. '1D', '1H', '5m') auf
-    - IBKR barSizeSetting (z.B. '1 day', '1 hour', '5 mins')
-    - und eine sinnvolle Anzahl Tage für die Historie.
-    """
-    tf = (timeframe or "").lower().strip()
-
-    # Tageschart → 180 Tage
-    if tf in ("1d", "d1", "1day", "1 day"):
-        return "1 day", 180
-
-    # Stundenchart → 60 Tage
-    if tf in ("1h", "h1", "1hour", "1 hour"):
-        return "1 hour", 60
-
-    # 5-Minuten-Chart → 10 Tage
-    if tf in ("5m", "5min", "5 mins", "5 minutes"):
-        return "5 mins", 10
-
-    # Fallback: alles Andere einfach durchreichen, 120 Tage
-    return timeframe, 120
-
-
-# ============================================================
-# 5. Orchestrator-Funktionen
+# 4. Orchestrator-Funktionen
 # ============================================================
 
 _news_client = NewsClient()
@@ -938,13 +785,10 @@ def run_single_symbol_mode(
 
     if _data_agent is None:
         raise RuntimeError(
-            "DataAgent ist nicht verfügbar (ibapi fehlt). Bitte `pip install ibapi` und DEF_DATA_AGENT aktivieren."
+            "DataAgent ist nicht verfügbar. Bitte DEF_DATA_AGENT aktivieren."
         )
 
-    # Timeframe → IBKR-Param (bar_size + days)
-    bar_size, days = _map_timeframe_to_ibkr(timeframe)
-
-    # 1) Marktdaten über IBKR-Socket-DataAgent
+    # 1) Marktdaten über DataAgent
     market_data = _data_agent.fetch(
         symbol=symbol,
         asset_type=asset_type,
