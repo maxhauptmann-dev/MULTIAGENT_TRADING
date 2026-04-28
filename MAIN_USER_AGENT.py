@@ -237,7 +237,7 @@ def start():
     account_info = {
         "account_size": float(os.getenv("ACCOUNT_SIZE", "100000")),
         "max_risk_per_trade": float(os.getenv("MAX_RISK_PER_TRADE", "0.01")),
-        "broker_preference": os.getenv("BROKER_PREFERENCE", "ibkr"),
+        "broker_preference": os.getenv("BROKER_PREFERENCE", "alpaca"),
     }
 
     # ---------------------------------------------------------

@@ -1,0 +1,58 @@
+{
+  "version": "1",
+  "created": "2026-04-26T09:56:48.426Z",
+  "runs": [
+    {
+      "command": "init",
+      "at": "2026-04-26T09:56:48.426Z",
+      "claudeStackVersion": "2.0.3",
+      "filesRead": [
+        "__digest__",
+        ".env",
+        "universe_manager.py",
+        "universe_loader.py",
+        "trading_agents_with_gpt.py",
+        "scheduler.py",
+        "risk.py",
+        "position_monitor.py",
+        "api_server.py",
+        "TRAIN_MODEL.py",
+        "TEST_SERPAPI.py",
+        "TEST_SCANNER_MODE.py",
+        "TEST_IBKR_DATA.py",
+        "TEST_FINNHUB.py",
+        "TEST_EXECUTION_AGENT_RUN.py",
+        "TEST_EXECUTE_SIMULATE.py",
+        "TEST_ENV.py"
+      ],
+      "snapshot": {
+        "__digest__": "47cf3800ddf26d61eeb2e57fd3a35947d6a5b1004e6d185e3db30eef8bd08b86",
+        ".env": "2b832a6082f8cf1c31fbf53ab44d95942c6acd39535c8e69a4f2f433a108b94f",
+        "universe_manager.py": "ef95dcb8e644a76e77cb4239ec90536a2f3f08943d7bac16916befafffea5dd8",
+        "universe_loader.py": "8dd2938c549d09c48974ccb6ec35ca6e3227fa97bc1c501f0f236be24400d8ac",
+        "trading_agents_with_gpt.py": "9624988b8fe891c586b44b8c98db4b0e66b454b5911c2eba786b0bd2f601a45b",
+        "scheduler.py": "899693a8cad8c02911f52e7b9d5a4221e35eccaf5cf87fd688d5504d7ef5a4c3",
+        "risk.py": "09b1128afb1cffb56328648ea1a5ad0268f972ee4e09834d1e5b760e62477fab",
+        "position_monitor.py": "224d476f6fc1a0a082477b75c2fb578c965fd26ac05cacd18af51a44a9f67726",
+        "api_server.py": "3ec5d4d8c5a391af4b94924220610c71450390501e51a520867b37b0d07b257a",
+        "TRAIN_MODEL.py": "409d25680f5b35aa386ee8a4072260902fff0e843365756c8a91db2b69a705ec",
+        "TEST_SERPAPI.py": "27849ca6e4121385a8f3f24554663f329136fe57a75d21135412fe05cf73ebd6",
+        "TEST_SCANNER_MODE.py": "14dbec809fa02f6e7d0a2bc36bfa6f97ef1a5e0317e73d863dcf968b82619129",
+        "TEST_IBKR_DATA.py": "5cc8d9393c3a858dd68ed192bd4065bb87a4f5d4720eaeeb4590afc97de265c5",
+        "TEST_FINNHUB.py": "d366fe969ca1540dea8cd99d9272b237fe0dabafe77df0356aa8bd289530c5ef",
+        "TEST_EXECUTION_AGENT_RUN.py": "c35fb599e0511d19aff2288555fa68d0bf37ca34f7b6521674c212776625f8da",
+        "TEST_EXECUTE_SIMULATE.py": "526b3b2a66abe2ab3d009bf2bbecae015cfaf977bc15d0321747b0df949789dd",
+        "TEST_ENV.py": "1dca89c1e8cf927dc4352deaa0b6412b75144a3410b8005436e4ae84af5effc5",
+        "CLAUDE.md": "a506e967214a4232351de066516c88ab42c5adc2d7638c3fb2001b985f9c319b",
+        ".mcp.json": "2b9b4fcbc35a81d3b4afd3eb9c11794763b6cba3031b924eea7a603d3c94275b",
+        ".claude/settings.json": "5727bfa1a31b99a0c7c1b706c8d7222f305aba0815bfd762022a9bf6437ea970"
+      },
+      "estimatedTokens": 6858,
+      "estimatedCost": {
+        "opus": 0.10287,
+        "sonnet": 0.020574000000000002,
+        "haiku": 0.005486400000000001
+      }
+    }
+  ]
+}

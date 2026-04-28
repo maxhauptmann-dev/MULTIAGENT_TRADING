@@ -176,6 +176,55 @@ def _process_symbol(
                 {"symbol": symbol, "synthese_output": synthese_output},
             ) or {"error": "no_result"}
 
+        # ── SIGNAL QUALITY GATE ─────────────────────────────────────────────────
+        _min_conf = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.60"))
+        _min_bp_long = float(os.getenv("MIN_BUY_PROB_LONG", "0.60"))
+        _max_bp_short = float(os.getenv("MAX_BUY_PROB_SHORT", "0.38"))
+        _short_enabled = os.getenv("SHORT_ENABLED", "0") == "1"
+        _min_synthese_conf = float(os.getenv("MIN_SYNTHESE_CONFIDENCE", "0.55"))
+
+        sig_conf = float(signal_output.get("confidence", 0)) if isinstance(signal_output, dict) else 0
+        sig_signal = signal_output.get("short_term_signal", "none") if isinstance(signal_output, dict) else "none"
+        buy_prob_raw = float(signal_output.get("buy_probability", 0.5)) if isinstance(signal_output, dict) else 0.5
+        synth_conf = float(synthese_output.get("overall_confidence", 0)) if isinstance(synthese_output, dict) else 0
+        synth_bias = synthese_output.get("overall_bias", "neutral") if isinstance(synthese_output, dict) else "neutral"
+
+        # Block: signal = "none" (neutral zone 0.38-0.60 in ML)
+        if sig_signal == "none":
+            return {
+                "symbol": symbol, "trade_plan": {"action": "no_trade", "reason": "ml_signal_neutral"},
+                "signal_output": signal_output, "synthese_output": synthese_output,
+            }
+
+        # Block: low confidence
+        if sig_conf < _min_conf:
+            return {
+                "symbol": symbol, "trade_plan": {"action": "no_trade", "reason": f"low_confidence_{sig_conf:.2f}"},
+                "signal_output": signal_output, "synthese_output": synthese_output,
+            }
+
+        # Block: synthese neutral/weak
+        if synth_bias == "neutral" or synth_conf < _min_synthese_conf:
+            return {
+                "symbol": symbol, "trade_plan": {"action": "no_trade", "reason": "synthese_neutral_or_weak"},
+                "signal_output": signal_output, "synthese_output": synthese_output,
+            }
+
+        # Block: bullish signal but not strong enough for long
+        if sig_signal == "bullish" and buy_prob_raw < _min_bp_long:
+            return {
+                "symbol": symbol, "trade_plan": {"action": "no_trade", "reason": f"buy_prob_too_low_{buy_prob_raw:.2f}"},
+                "signal_output": signal_output, "synthese_output": synthese_output,
+            }
+
+        # Block: bearish signal but shorts disabled
+        if sig_signal == "bearish" and not _short_enabled:
+            return {
+                "symbol": symbol, "trade_plan": {"action": "no_trade", "reason": "short_disabled"},
+                "signal_output": signal_output, "synthese_output": synthese_output,
+            }
+        # ── END SIGNAL QUALITY GATE ─────────────────────────────────────────────
+
         # Handels-Plan – mit Market-Regime Gate
         handels_input = {
             "symbol":          symbol,
@@ -185,6 +234,8 @@ def _process_symbol(
             "market_meta":     market_meta,
             "market_regime":   market_regime.get("regime", "neutral"),
             "market_regime_info": market_regime,
+            "short_enabled":   _short_enabled,
+            "ml_signal_direction": "short" if sig_signal == "bearish" else "long",
         }
 
         # Sentiment-Gating: News-Sentiment vs Market-Regime
@@ -204,6 +255,19 @@ def _process_symbol(
         # CircuitBreaker
         if not _scanner_cb.allow():
             trade_plan = {"action": "no_trade", "reason": "circuit_breaker_open"}
+
+        # ── MINIMUM REWARD/RISK RATIO FILTER ────────────────────────────────────
+        _min_rr = float(os.getenv("MIN_RR_RATIO", "1.5"))
+        if isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
+            rr_ratio = None
+            try:
+                rr_ratio = float(trade_plan.get("take_profit", {}).get("reward_risk_ratio"))
+            except Exception:
+                pass
+            if rr_ratio is not None and rr_ratio < _min_rr:
+                trade_plan["action"] = "no_trade"
+                trade_plan["reason"] = f"rr_too_low_{rr_ratio:.2f}_min_{_min_rr}"
+        # ── END MINIMUM REWARD/RISK RATIO FILTER ────────────────────────────────
 
         # Positionsgröße — Kelly wenn ML-Signal, sonst festes Risiko
         if isinstance(trade_plan, dict) and trade_plan.get("action") == "open_position":
@@ -237,11 +301,21 @@ def _process_symbol(
             if size_reduction_factor != 1.0:
                 sizing["qty"] = max(1, int(sizing.get("qty", 0) * size_reduction_factor))
 
-            # ── POSITION SIZE CAP (Max 2% per position per DEFAULT) ──
+            # ── DYNAMIC POSITION SIZE CAP (based on signal confidence) ──
             qty = sizing.get("qty", 0)
             if qty > 0 and last_close > 0:
-                max_position_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.02"))  # 2% DEFAULT (=2k$ bei 100k account)
-                max_position_value = acct_size * max_position_pct
+                # Dynamic position cap based on signal confidence
+                _base_max_pct = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.02"))
+                if sig_conf >= 0.85:
+                    dynamic_max_pct = min(_base_max_pct * 2.5, 0.05)   # 5% für Top-Signale
+                elif sig_conf >= 0.75:
+                    dynamic_max_pct = min(_base_max_pct * 1.5, 0.03)   # 3%
+                elif sig_conf >= 0.65:
+                    dynamic_max_pct = _base_max_pct                     # 2% default
+                else:
+                    dynamic_max_pct = _base_max_pct * 0.5              # 1% für schwache
+
+                max_position_value = acct_size * dynamic_max_pct
                 position_value = qty * last_close
                 if position_value > max_position_value:
                     old_qty = qty

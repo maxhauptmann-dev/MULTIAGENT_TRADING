@@ -8,7 +8,7 @@ account_info = {
     "account_size": 100000,
     "max_risk_per_trade": 0.01,
     "time_horizon": "short",
-    "broker_preference": "ibkr",
+    "broker_preference": "alpaca",
 }
 
 # --- Watchlist ---

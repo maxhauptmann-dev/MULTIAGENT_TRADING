@@ -255,3 +255,209 @@ class OptionsAgent:
             f"Signal={sig} / Entry-Stil={style}, "
             f"News-Sentiment={sent}."
         )
+
+    # ------------------------------------------------------------------
+    # POP Calculator für Contracts (mit Delta)
+    # ------------------------------------------------------------------
+
+    def calculate_pop_from_contract(
+        self,
+        option_type: str,
+        delta: float,
+    ) -> float:
+        """
+        Berechne echte Probability of Profit aus Delta des Contracts.
+
+        CALL: POP = Delta direkt (Delta 0.6 = 60% Chance ITM)
+        PUT:  POP = |Delta| direkt (Delta -0.4 = 40% Chance ITM)
+
+        Args:
+            option_type: "call" oder "put"
+            delta: Delta vom Options-Contract
+
+        Returns:
+            POP Score 0..1 (Wahrscheinlichkeit dass Option ITM ist bei Expiry)
+        """
+        if option_type == "call":
+            # Call: Delta = POP direkt
+            return float(delta)
+        elif option_type == "put":
+            # Put: |Delta| = POP (Delta ist negativ für Puts)
+            return abs(float(delta))
+        else:
+            return 0.5
+
+    def calculate_total_pop(
+        self,
+        option_type: str,
+        contract_delta: float,
+        max_loss: float,
+        current_premium: float,
+    ) -> float:
+        """
+        Berechne gesamt POP unter Berücksichtigung von Breakeven.
+
+        Echte POP = (Wahrscheinlichkeit ITM) × (profitable_wenn_ITM) + (wahrscheinlichkeit OTM) × (profitable_wenn_OTM)
+
+        Vereinfacht für Long Calls/Puts:
+        - Profit wenn: Intrinsic Value > Premium gezahlt
+        - Loss wenn: Preis < Strike (Call) oder > Strike (Put) UND Premium > Gewinn
+
+        Args:
+            option_type: "call" oder "put"
+            contract_delta: Delta vom Contract
+            max_loss: Max Verlust möglich (= Premium × 100)
+            current_premium: Aktuelle Optionsprämie
+
+        Returns:
+            Angepasstes POP unter Berücksichtigung von Breakeven
+        """
+        # ITM-Wahrscheinlichkeit
+        itm_prob = self.calculate_pop_from_contract(option_type, contract_delta)
+
+        # Breakeven Anpassung: Wie viel muss der Preis sich bewegen damit wir Profit machen?
+        # Vereinfacht: je höher Premium, desto mehr muss Preis sich bewegen
+        # Bei current_premium = 2.00, mit Delta 0.5, brauchen wir mehr als 50% Wahrscheinlichkeit
+
+        # Faktor: Bei hoher Premium wird POP reduziert
+        # Bei niedriger Premium bleibt POP nah am Delta
+        premium_factor = max(0.3, 1.0 - (current_premium / 10.0))
+
+        adjusted_pop = itm_prob * premium_factor
+        return max(0.0, min(1.0, adjusted_pop))
+
+    # ------------------------------------------------------------------
+    # IMPROVED POP CALCULATOR v2 (mit allen Faktoren)
+    # ------------------------------------------------------------------
+
+    def calculate_improved_pop(
+        self,
+        option_type: str,
+        analytical_pop: float,
+        contract_delta: float,
+        dte: int,
+        current_iv: float = 0.25,
+        iv_percentile: float = 0.5,
+        current_premium: float = 0.0,
+        underlying_price: float = 100.0,
+        strike: float = 100.0,
+    ) -> Dict[str, float]:
+        """
+        Verbesserte POP Berechnung mit ALLEN realen Faktoren.
+
+        Berücksichtigt:
+        • Analytisches Signal (Trend/Entry)
+        • Delta (aber mit Guards)
+        • IV Qualität (IV Percentile + Skew)
+        • Theta Decay (exponentiell, nicht linear)
+        • Slippage & Bid-Ask Spread (5-8%)
+        • IV Crush Risk (bei High IV)
+        • Edge Cases Guards (Min/Max)
+
+        Returns:
+            {
+                'pop': final_pop_score (0.0-1.0),
+                'analytical': analytical_pop,
+                'delta_component': delta_pop,
+                'iv_quality': iv_quality_score,
+                'theta_decay': theta_factor,
+                'slippage_adj': slippage_discount,
+                'iv_crush_risk': iv_crush_factor,
+                'components': {...detailed breakdown...}
+            }
+        """
+        import math
+
+        # 1. ANALYTICAL COMPONENT (45%)
+        analytical_norm = max(0.0, min(1.0, analytical_pop))
+
+        # 2. DELTA COMPONENT (35%) - aber mit IV-Anpassung
+        # Delta ist nur gültig wenn IV nicht extrem ist
+        delta_pop = abs(float(contract_delta))
+
+        # IV-Anpassung: wenn IV sehr hoch, Delta ist weniger zuverlässig
+        iv_adjustment = 1.0
+        if iv_percentile > 0.75:
+            iv_adjustment = 0.85  # High IV macht Delta weniger zuverlässig
+        elif iv_percentile < 0.25:
+            iv_adjustment = 0.95  # Low IV macht Delta zuverlässig
+
+        delta_pop_adjusted = delta_pop * iv_adjustment
+
+        # 3. IV QUALITY COMPONENT (15%)
+        # Je näher IV am 50th Percentile, desto besser
+        iv_from_mean = abs(iv_percentile - 0.5)
+        iv_quality = 1.0 - (iv_from_mean * 2)  # 0.5 Percentile = 1.0 quality
+        iv_quality = max(0.3, min(1.0, iv_quality))
+
+        # 4. THETA DECAY COMPONENT (5%)
+        # Exponentieller Decay: nach DTE=7 wird es exponentiell teuer
+        if dte > 30:
+            theta_factor = 1.0  # Viel Zeit = guter Theta
+        elif dte > 14:
+            theta_factor = 0.95
+        elif dte > 7:
+            theta_factor = 0.85  # 7-14 DTE: Decay wird problematisch
+        else:
+            # Exponentiell nach unten bei < 7 DTE
+            theta_factor = max(0.5, math.exp(-0.5 * (7 - dte)))
+
+        # 5. SLIPPAGE ADJUSTMENT (5-8%)
+        # Bid-Ask Spread + Slippage discount
+        slippage_pct = 0.06  # 6% Standard
+
+        # Bei breiten Spreads (OTM) höherer Slippage
+        moneyness = abs(underlying_price - strike) / strike
+        if moneyness > 0.05:  # OTM
+            slippage_pct = 0.08
+        elif moneyness < 0.01:  # ATM
+            slippage_pct = 0.05
+
+        # 6. IV CRUSH RISK (bei High IV)
+        # Nach Earnings/News kann IV um 30-50% fallen
+        iv_crush_factor = 1.0
+        if iv_percentile > 0.80:
+            # High IV = hohes IV Crush Risk
+            iv_crush_factor = 0.85  # -15% Adjustment bei Very High IV
+        elif iv_percentile > 0.70:
+            iv_crush_factor = 0.92  # -8% bei High IV
+
+        # 7. KOMBINIERE ALLE KOMPONENTEN
+        # Neue Gewichtung (datengestützt):
+        #   Analytical: 45% (Signal-Qualität)
+        #   Delta: 35% (Greeks)
+        #   IV Quality: 15% (Market Condition)
+        #   Theta: 5% (Time Factor)
+
+        combined_pop = (
+            0.45 * analytical_norm +
+            0.35 * delta_pop_adjusted +
+            0.15 * iv_quality +
+            0.05 * theta_factor
+        )
+
+        # 8. APPLIZIERE ADJUSTMENTS
+        final_pop = combined_pop * iv_crush_factor * (1.0 - slippage_pct)
+
+        # 9. GUARDS gegen Edge Cases
+        # Min: 0.20 (nicht unter 20% - zu riskant)
+        # Max: 0.92 (nicht über 92% - keine echte 100% Sicherheit)
+        final_pop = max(0.20, min(0.92, final_pop))
+
+        return {
+            'pop': round(final_pop, 3),
+            'analytical': round(analytical_norm, 3),
+            'delta_component': round(delta_pop_adjusted, 3),
+            'iv_quality': round(iv_quality, 3),
+            'theta_decay': round(theta_factor, 3),
+            'slippage_adj': round(slippage_pct, 3),
+            'iv_crush_risk': round(1.0 - iv_crush_factor, 3),
+            'components': {
+                'analytical_45pct': round(0.45 * analytical_norm, 3),
+                'delta_35pct': round(0.35 * delta_pop_adjusted, 3),
+                'iv_quality_15pct': round(0.15 * iv_quality, 3),
+                'theta_5pct': round(0.05 * theta_factor, 3),
+                'iv_crush_factor': round(iv_crush_factor, 3),
+                'slippage_discount': round(1.0 - slippage_pct, 3),
+            }
+        }

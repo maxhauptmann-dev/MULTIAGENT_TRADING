@@ -30,10 +30,10 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		50A1A80E2F9BDC9800640E6D /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */ = {
+		5068EADC2F9E37FC00E5CE75 /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				"mac-dashboard1-Info.plist",
+				Info.plist,
 			);
 			target = 50A1A7C62F9BDA8E00640E6D /* mac_dashboard1 */;
 		};
@@ -43,7 +43,7 @@
 		50A1A7C92F9BDA8E00640E6D /* mac_dashboard1 */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				50A1A80E2F9BDC9800640E6D /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */,
+				5068EADC2F9E37FC00E5CE75 /* Exceptions for "mac_dashboard1" folder in "mac_dashboard1" target */,
 			);
 			path = mac_dashboard1;
 			sourceTree = "<group>";
@@ -408,11 +408,11 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "mac-dashboard1-Info.plist";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "mac_dashboard1/Info 3.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -439,11 +439,11 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "mac-dashboard1-Info.plist";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "mac_dashboard1/Info 3.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

@@ -303,6 +303,78 @@ def trigger_scan():
         return jsonify(_json_response({"error": str(e)}, status="error")), 500
 
 
+@app.route("/api/options-positions", methods=["GET"])
+def options_positions():
+    """GET /api/options-positions - Get all open options positions."""
+    try:
+        conn = _connect_db()
+        cur = conn.execute("""
+            SELECT id, symbol, option_symbol, option_type, strike, expiry,
+                   contracts, premium_paid, delta_at_entry, opened_at, pnl
+            FROM options_positions
+            WHERE status='open'
+            ORDER BY opened_at DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        positions = []
+        for row in rows:
+            positions.append({
+                "id": row[0],
+                "symbol": row[1],
+                "option_symbol": row[2],
+                "option_type": row[3],
+                "strike": row[4],
+                "expiry": row[5],
+                "contracts": row[6],
+                "premium_paid": row[7],
+                "delta": row[8],
+                "opened_at": row[9],
+                "pnl": row[10],
+            })
+
+        return jsonify(_json_response({"positions": positions}))
+    except Exception as e:
+        logger.error(f"Error fetching options positions: {e}")
+        return jsonify(_json_response({"error": str(e)}, status="error")), 500
+
+
+@app.route("/api/options-status", methods=["GET"])
+def options_status():
+    """GET /api/options-status - Get options trading status."""
+    try:
+        conn = _connect_db()
+
+        # Count open options
+        open_count = conn.execute(
+            "SELECT COUNT(*) FROM options_positions WHERE status='open'"
+        ).fetchone()[0]
+
+        # Sum P&L
+        total_pnl = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM options_positions WHERE status='open'"
+        ).fetchone()[0]
+
+        # Last scan time (from closed options)
+        last_closed = conn.execute(
+            "SELECT MAX(closed_at) FROM options_positions WHERE status LIKE 'closed_%'"
+        ).fetchone()[0]
+
+        conn.close()
+
+        return jsonify(_json_response({
+            "enabled": int(os.getenv("OPTIONS_ENABLED", "0")) == 1,
+            "auto_execute": int(os.getenv("OPTIONS_AUTO_EXECUTE", "0")) == 1,
+            "open_positions": open_count,
+            "total_pnl": round(float(total_pnl), 2) if total_pnl else 0,
+            "last_closed_at": last_closed,
+        }))
+    except Exception as e:
+        logger.error(f"Error fetching options status: {e}")
+        return jsonify(_json_response({"error": str(e)}, status="error")), 500
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     """GET /api/health - Server health check."""

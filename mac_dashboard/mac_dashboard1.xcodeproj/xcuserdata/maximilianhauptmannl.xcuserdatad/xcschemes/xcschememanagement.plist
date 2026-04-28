@@ -10,5 +10,23 @@
 			<integer>0</integer>
 		</dict>
 	</dict>
+	<key>SuppressBuildableAutocreation</key>
+	<dict>
+		<key>50A1A7C62F9BDA8E00640E6D</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>50A1A7D32F9BDA8F00640E6D</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>50A1A7DD2F9BDA8F00640E6D</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+	</dict>
 </dict>
 </plist>

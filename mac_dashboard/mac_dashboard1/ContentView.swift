@@ -397,8 +397,8 @@ struct ScannerLogsView: View {
 struct SettingsView: View {
     @ObservedObject var api: TradingBotAPI
     @Environment(\.presentationMode) var presentationMode
-    @State private var vpsIP = "localhost"
-    @State private var vpsPort = "5000"
+    @State private var vpsIP = ""
+    @State private var vpsPort = ""
 
     var body: some View {
         VStack(spacing: 16) {
@@ -431,6 +431,8 @@ struct SettingsView: View {
                 Button("Save") {
                     if let port = Int(vpsPort) {
                         api.setVPSAddress(ip: vpsIP, port: port)
+                        UserDefaults.standard.set(vpsIP, forKey: "vpsIP")
+                        UserDefaults.standard.set(port, forKey: "vpsPort")
                         api.testConnection()
                     }
                     presentationMode.wrappedValue.dismiss()
@@ -442,6 +444,11 @@ struct SettingsView: View {
         }
         .padding()
         .frame(width: 300)
+        .onAppear {
+            vpsIP = UserDefaults.standard.string(forKey: "vpsIP") ?? "87.106.167.252"
+            let savedPort = UserDefaults.standard.integer(forKey: "vpsPort")
+            vpsPort = savedPort > 0 ? String(savedPort) : "5000"
+        }
     }
 }
 

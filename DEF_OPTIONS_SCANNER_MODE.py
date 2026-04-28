@@ -149,6 +149,74 @@ def _process_options_symbol(
                 "reason": "no_contract_found",
             }
 
+        # Berechne IMPROVED POP mit allen realen Faktoren
+        contract_delta = contract.get("delta", delta_target)
+        analytical_pop = options_plan.get("pop_score", 0)
+        dte = contract.get("dte", 30)
+        strike = contract.get("strike", 0)
+
+        # Für IV-Qualität benötigen wir IV-Daten - nutze Synthese-Output wenn verfügbar
+        current_iv = 0.25  # Default
+        iv_percentile = 0.5  # Default middle
+        if market_meta:
+            vol_level = market_data.get("volatility_level", "").lower()
+            # Map volatility_level zu IV-Wert und Percentile
+            if vol_level in ("high", "hoch"):
+                current_iv = 0.40
+                iv_percentile = 0.75
+            elif vol_level in ("very_high", "extrem"):
+                current_iv = 0.60
+                iv_percentile = 0.85
+            elif vol_level in ("low", "niedrig"):
+                current_iv = 0.15
+                iv_percentile = 0.25
+
+        # Aktuelle Premium (vereinfacht: nutze mid-point Estimate)
+        current_premium = 0.0
+        if strike > 0:
+            moneyness = abs(market_data.get("price", strike) - strike) / strike
+            # Grobe Schätzung: ATM ~2-3%, OTM ~0.5-1.5%
+            if moneyness < 0.01:
+                current_premium = 2.5
+            elif moneyness < 0.05:
+                current_premium = 1.5
+            else:
+                current_premium = 0.75
+
+        # IMPROVED POP Berechnung
+        pop_result = _options_agent.calculate_improved_pop(
+            option_type=opt_type,
+            analytical_pop=analytical_pop,
+            contract_delta=contract_delta,
+            dte=dte,
+            current_iv=current_iv,
+            iv_percentile=iv_percentile,
+            current_premium=current_premium,
+            underlying_price=market_data.get("price", strike),
+            strike=strike,
+        )
+
+        improved_pop = pop_result["pop"]
+
+        # Aktualisiere options_plan mit ALLEN POP-Details
+        options_plan["pop_score"] = improved_pop  # Update mit improved value
+        options_plan["analytical_pop"] = round(analytical_pop, 3)
+        options_plan["improved_pop_breakdown"] = pop_result
+        options_plan["iv_environment"] = {
+            "current_iv": round(current_iv, 3),
+            "iv_percentile": round(iv_percentile, 3),
+            "iv_crush_risk": pop_result.get("iv_crush_risk", 0),
+        }
+
+        # Nutze IMPROVED_POP für Threshold-Check
+        if improved_pop < _MIN_POP:
+            return {
+                "symbol": symbol,
+                "options_plan": options_plan,
+                "contract": contract,
+                "reason": f"improved_pop_too_low_{improved_pop:.2f}",
+            }
+
         # Optional: Auto-Execute
         execution_result = None
         if auto_execute:

@@ -13,7 +13,7 @@ account_info = {
     "account_size": 10000,          # dein Konto in $
     "max_risk_per_trade": 0.001,     # 1% Risiko pro Trade
     "time_horizon": "short",        # "short" / "medium" / "long"
-    "broker_preference": "ibkr",    # für ExecutionAgent (jetzt noch optional)
+    "broker_preference": "alpaca",    # für ExecutionAgent (Alpaca nur)
 }
 
 # 2) Orchestrator aufrufen (Modus A – Einzelaktie)

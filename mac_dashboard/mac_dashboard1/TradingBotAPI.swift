@@ -1,17 +1,17 @@
 import Foundation
-import Foundation
 import SwiftUI
 import Combine
+
 // MARK: - Data Models
 
-struct APIResponse<T: Codable>: Codable {
+struct APIResponse<T: Codable>: Codable, Sendable {
     let status: String
     let timestamp: String
     let data: T
 }
 
-struct Position: Codable, Identifiable {
-    let id: UUID = UUID()
+struct Position: Codable, Identifiable, Sendable {
+    var id: UUID = UUID()
     let symbol: String
     let direction: String  // "long" or "short"
     let entry_price: Double
@@ -27,43 +27,31 @@ struct Position: Codable, Identifiable {
     let atr_14: Double?
     let kelly_fraction: Double?
 
-    var pnlColor: Color {
-        pnl_dollar >= 0 ? .green : .red
-    }
-
     var directionLabel: String {
         direction.uppercased()
     }
 }
 
-struct PositionsResponse: Codable {
+struct PositionsResponse: Codable, Sendable {
     let positions: [Position]
 }
 
-struct MarketRegime: Codable {
+struct MarketRegime: Codable, Sendable {
     let regime: String  // "bull", "bear", "neutral"
     let spy_vs_ema20_pct: Double
     let qqq_vs_ema20_pct: Double
     let vix: Double
-
-    var regimeColor: Color {
-        switch regime {
-        case "bull": return .green
-        case "bear": return .red
-        default: return .gray
-        }
-    }
 }
 
-struct MarketRegimeResponse: Codable {
+struct MarketRegimeResponse: Codable, Sendable {
     let regime: String
     let spy_vs_ema20_pct: Double
     let qqq_vs_ema20_pct: Double
     let vix: Double
 }
 
-struct Trade: Codable, Identifiable {
-    let id: UUID = UUID()
+struct Trade: Codable, Identifiable, Sendable {
+    var id: UUID = UUID()
     let symbol: String
     let direction: String
     let entry_price: Double?
@@ -77,36 +65,31 @@ struct Trade: Codable, Identifiable {
     var isOpen: Bool {
         closed_at == nil
     }
-
-    var pnlColor: Color {
-        guard let pnl = pnl else { return .gray }
-        return pnl >= 0 ? .green : .red
-    }
 }
 
-struct TradesResponse: Codable {
+struct TradesResponse: Codable, Sendable {
     let trades: [Trade]
 }
 
-struct ScannerStatus: Codable {
+struct ScannerStatus: Codable, Sendable {
     let last_scan: String?
     let trades_opened_today: Int
     let status: String
 }
 
-struct ScannerStatusResponse: Codable {
+struct ScannerStatusResponse: Codable, Sendable {
     let last_scan: String?
     let trades_opened_today: Int
     let status: String
 }
 
-struct LogsResponse: Codable {
+struct LogsResponse: Codable, Sendable {
     let logs: [String]
 }
 
 // MARK: - API Client
 
-class TradingBotAPI: NSObject, ObservableObject {
+class TradingBotAPI: NSObject, ObservableObject, URLSessionDelegate {
     @Published var positions: [Position] = []
     @Published var marketRegime: MarketRegime?
     @Published var tradestoday: [Trade] = []
@@ -119,12 +102,35 @@ class TradingBotAPI: NSObject, ObservableObject {
     private var vpsPort: Int
     private let refreshInterval: TimeInterval
     private var refreshTimer: Timer?
+    private var session: URLSession!
 
-    init(vpsIP: String = "localhost", vpsPort: Int = 5000, refreshInterval: TimeInterval = 60) {
-        self.vpsIP = vpsIP
-        self.vpsPort = vpsPort
+    init(vpsIP: String = "87.106.167.252", vpsPort: Int = 5000, refreshInterval: TimeInterval = 60) {
+        // Load saved settings from UserDefaults
+        let savedIP = UserDefaults.standard.string(forKey: "vpsIP") ?? vpsIP
+        let savedPort = UserDefaults.standard.integer(forKey: "vpsPort")
+
+        self.vpsIP = savedIP
+        self.vpsPort = savedPort > 0 ? savedPort : vpsPort
         self.refreshInterval = refreshInterval
+
         super.init()
+
+        // Configure URLSession
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = false
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 60
+
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+
+        // Ensure defaults are set for VPS address
+        self.setVPSAddress(ip: "87.106.167.252", port: 5000)
+        if let ats = Bundle.main.infoDictionary?["NSAppTransportSecurity"] {
+            print("ATS settings: \(ats)")
+        } else {
+            print("ATS settings not found in Info.plist")
+        }
+        print("Info.plist path: \(Bundle.main.path(forResource: "Info", ofType: "plist") ?? "nil")")
 
         // Test connection on init
         testConnection()
@@ -133,6 +139,15 @@ class TradingBotAPI: NSObject, ObservableObject {
     func setVPSAddress(ip: String, port: Int) {
         self.vpsIP = ip
         self.vpsPort = port
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        let credential = URLCredential(trust: trust)
+        completionHandler(.useCredential, credential)
     }
 
     private var baseURL: String {
@@ -160,11 +175,14 @@ class TradingBotAPI: NSObject, ObservableObject {
 
         print("Testing connection to: \(url.absoluteString)")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        self.session.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 if let error = error {
                     let nsError = error as NSError
-                    let errorMsg = "Error: \(nsError.domain) [\(nsError.code)] - \(error.localizedDescription)"
+                    var errorMsg = "Error: \(nsError.domain) [\(nsError.code)] - \(error.localizedDescription)"
+                    if nsError.domain == NSURLErrorDomain && nsError.code == -1022 {
+                        errorMsg = "App Transport Security blocked the request (-1022). Ensure Info.plist allows HTTP to 87.106.167.252:5000."
+                    }
                     print(errorMsg)
                     self?.isConnected = false
                     self?.errorMessage = errorMsg
@@ -256,7 +274,7 @@ class TradingBotAPI: NSObject, ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+        self.session.dataTask(with: request) { [weak self] _, response, error in
             DispatchQueue.main.async {
                 if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
                     self?.errorMessage = "Scan triggered (results in 30-60s)"
@@ -271,12 +289,17 @@ class TradingBotAPI: NSObject, ObservableObject {
 
     private func fetch<T: Codable>(endpoint: String, completion: @escaping (T) -> Void) {
         let url = URL(string: "\(baseURL)\(endpoint)")!
+        print("DEBUG: Request URL = \(url.absoluteString)")
         let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        self.session.dataTask(with: request) { [weak self] data, response, error in
             guard let data = data, error == nil else {
                 DispatchQueue.main.async {
-                    self?.errorMessage = error?.localizedDescription ?? "Network error"
+                    if let nsError = error as NSError?, nsError.domain == NSURLErrorDomain && nsError.code == -1022 {
+                        self?.errorMessage = "ATS blocked HTTP (-1022). Check Info.plist App Transport Security settings for 87.106.167.252:5000."
+                    } else {
+                        self?.errorMessage = error?.localizedDescription ?? "Network error"
+                    }
                 }
                 return
             }
@@ -292,3 +315,29 @@ class TradingBotAPI: NSObject, ObservableObject {
         }.resume()
     }
 }
+@MainActor
+extension Position {
+    var pnlColor: Color {
+        pnl_dollar >= 0 ? .green : .red
+    }
+}
+
+@MainActor
+extension MarketRegime {
+    var regimeColor: Color {
+        switch regime {
+        case "bull": return .green
+        case "bear": return .red
+        default: return .gray
+        }
+    }
+}
+
+@MainActor
+extension Trade {
+    var pnlColor: Color {
+        guard let pnl = pnl else { return .gray }
+        return pnl >= 0 ? .green : .red
+    }
+}
+

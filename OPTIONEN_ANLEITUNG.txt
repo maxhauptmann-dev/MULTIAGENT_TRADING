@@ -1,0 +1,354 @@
+================================================================================
+OPTIONEN-TRADING AKTIVIEREN & TESTEN
+Anleitung für AI_TRADING System auf Linux Server
+================================================================================
+
+OVERVIEW
+--------
+Das Optionen-System läuft PARALLEL zum Aktien-Trading:
+- Völlig unabhängig konfigurierbar
+- Kann jederzeit an/aus geschaltet werden (OPTIONS_ENABLED Toggle)
+- Eigener Scanner, Monitor, Scheduler-Jobs
+- Nutzt Alpaca Options API (kostenlos im Base Plan)
+
+WICHTIG: Montag läuft zuerst NUR Aktien-Trading. Optionen werden DANACH aktiviert.
+
+
+================================================================================
+SCHRITT 1: STOCK-TRADING ÜBERPRÜFUNG (MONTAG)
+================================================================================
+
+Vor dem Starten sicherstellen:
+
+1. SSH zum Server:
+   ssh root@87.106.167.252
+
+2. In das Projekt-Verzeichnis gehen:
+   cd /root/Projekte/PycharmProjects/AI_TRADING
+
+3. .env überprüfen – diese Zeilen MÜSSEN so aussehen:
+   grep -E "^(SCHEDULER_MARKETS|OPTIONS_ENABLED|SCHEDULER_AUTO_EXECUTE)" .env
+
+   Erwartet für Montag:
+   SCHEDULER_MARKETS=US                    ✓
+   SCHEDULER_AUTO_EXECUTE=0                ✓ (Review-Modus zuerst)
+   OPTIONS_ENABLED=0                       ✓ (Aus)
+
+4. Services starten:
+   sudo systemctl restart trading-scheduler
+   sudo systemctl restart trading-api
+
+5. Status prüfen (sollte 'active (running)' sein):
+   sudo systemctl status trading-scheduler
+   sudo systemctl status trading-api
+
+6. Logs monitoren (live folgen):
+   sudo journalctl -u trading-scheduler -f
+   # In anderem Terminal:
+   sudo journalctl -u trading-api -f
+
+7. Dashboard-API testen:
+   # Positionen heute (sollte leer sein vor Marktöffnung):
+   curl -s http://localhost:5000/api/positions | python3 -m json.tool
+
+   # Scanner-Status:
+   curl -s http://localhost:5000/api/scanner-status | python3 -m json.tool
+
+   # Market Regime (sollte aktuell sein):
+   curl -s http://localhost:5000/api/market-regime | python3 -m json.tool
+
+
+================================================================================
+SCHRITT 2: OPTIONEN AKTIVIEREN (NACH MONDAY VALIDIERUNG)
+================================================================================
+
+Nachdem Stock-Trading stabil läuft:
+
+1. SSH zum Server:
+   ssh root@87.106.167.252
+
+2. .env Datei öffnen:
+   nano /root/Projekte/PycharmProjects/AI_TRADING/.env
+
+3. Diese Zeilen hinzufügen/ändern:
+
+   # Options aktivieren
+   OPTIONS_ENABLED=1
+
+   # Options im Review-Modus testen (kein Auto-Trading noch):
+   OPTIONS_AUTO_EXECUTE=0
+
+   # Nur während Marktöffnung scannen (nicht 24/7):
+   OPTIONS_24_7=0
+   OPTIONS_SCAN_HOUR=9
+   OPTIONS_SCAN_MINUTE=45
+
+   # Options-Scanner-Einstellungen:
+   OPTIONS_MIN_POP=0.65          # Min. Probability-of-Profit Score
+   OPTIONS_DTE_MIN=20             # Min. Days-To-Expiry
+   OPTIONS_DTE_MAX=45             # Max. Days-To-Expiry
+
+   # OPTIONAL – später setzen wenn auto_execute aktiviert:
+   # OPTIONS_AUTO_EXECUTE=1
+
+4. Datei speichern (Ctrl+O, Enter, Ctrl+X)
+
+5. Services neu starten (damit .env geladen wird):
+   sudo systemctl restart trading-scheduler
+   sudo systemctl restart trading-api
+
+6. Überprüfen dass Options-Job registriert ist:
+   sudo journalctl -u trading-scheduler -n 20
+
+   Sollte enthalten:
+   "Job: Options Scanner @ 09:45 ET"
+
+
+================================================================================
+SCHRITT 3: OPTIONS-SYSTEM TESTEN (REVIEW-MODUS)
+================================================================================
+
+Mit OPTIONS_ENABLED=1 und OPTIONS_AUTO_EXECUTE=0:
+
+TEST 1: API-Endpoints testen
+-----
+1. Terminal öffnen:
+   ssh root@87.106.167.252
+
+2. Options-Positionen prüfen (sollte leer sein):
+   curl -s http://localhost:5000/api/options-positions | python3 -m json.tool
+
+3. Options-Status prüfen:
+   curl -s http://localhost:5000/api/options-status | python3 -m json.tool
+
+   Erwartet:
+   {
+     "status": "ok",
+     "data": {
+       "enabled": true,
+       "auto_execute": false,
+       "open_positions": 0,
+       "total_pnl": 0,
+       "last_closed_at": null
+     }
+   }
+
+
+TEST 2: Manual Scanner Trigger
+-----
+1. Scanner manuell triggern (nicht warten auf 09:45 ET):
+   curl -s -X POST http://localhost:5000/api/trigger-scan | python3 -m json.tool
+
+   Erwartet:
+   {
+     "status": "ok",
+     "data": {
+       "status": "scan_queued",
+       "message": "Manual scan enqueued (results in 30-60s)"
+     }
+   }
+
+2. 60 Sekunden warten, dann Logs prüfen:
+   sudo journalctl -u trading-scheduler -n 30 | grep -i "options"
+
+   Sollte zeigen:
+   - "[Options Scanner] Market Regime: ..."
+   - "[Options Scanner] Starting: XX symbols, Y workers"
+   - "[Options] ... (pro Symbol)"
+
+
+TEST 3: Options Chain Lookup prüfen
+-----
+Direkt mit Alpaca API testen:
+
+   curl -s "https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbol=AAPL&type=call&expiration_date_gte=2026-05-16&expiration_date_lte=2026-06-30" \
+     -H "APCA-API-KEY-ID: YOUR_KEY" \
+     -H "APCA-API-SECRET-KEY: YOUR_SECRET" | python3 -m json.tool | head -50
+
+   Sollte Contracts mit OCC Symbols zurückgeben (z.B. AAPL260516C00180000)
+
+
+TEST 4: Datenbank Schema prüfen
+-----
+1. SQLite öffnen:
+   sqlite3 /root/Projekte/PycharmProjects/AI_TRADING/positions.db
+
+2. Options-Tabelle anschauen:
+   .schema options_positions
+
+3. Sollte zeigen (mind. diese Spalten):
+   - symbol
+   - option_symbol (OCC Format)
+   - option_type (call/put)
+   - strike
+   - expiry
+   - dte_at_entry
+   - contracts
+   - premium_paid
+   - delta_at_entry
+   - opened_at
+   - status
+   - pnl
+
+4. Aktuelle offene Optionen (sollte leer sein):
+   SELECT symbol, option_symbol, contracts, status FROM options_positions WHERE status='open';
+
+5. Exit:
+   .quit
+
+
+================================================================================
+SCHRITT 4: AUTO-EXECUTION AKTIVIEREN (OPTIONAL, NUR NACH VALIDIERUNG)
+================================================================================
+
+Erst nachdem Dein Team 100% sicher ist, dass Options-Scanning funktioniert:
+
+1. .env öffnen:
+   nano /root/Projekte/PycharmProjects/AI_TRADING/.env
+
+2. Umschalten zu echtem Trading:
+   OPTIONS_AUTO_EXECUTE=1
+
+3. Services neu starten:
+   sudo systemctl restart trading-scheduler
+
+4. Überprüfen dass Auto-Execute aktiv ist:
+   sudo journalctl -u trading-scheduler -n 5 | grep "OPTIONS_AUTO_EXECUTE"
+
+
+================================================================================
+SCHRITT 5: MONITORING & LOGS
+================================================================================
+
+Live-Logs anschauen:
+   sudo journalctl -u trading-scheduler -f
+
+Nur Options-relevante Logs:
+   sudo journalctl -u trading-scheduler -f | grep -i "options"
+
+Fehler finden:
+   sudo journalctl -u trading-scheduler | grep "error\|Error\|ERROR"
+
+Dashboard überprüfen (4x pro Tag nach Scanner-Runs):
+   curl -s http://localhost:5000/api/options-status | python3 -m json.tool
+
+
+================================================================================
+NOTFALL: OPTIONEN SCHNELL AUSSCHALTEN
+================================================================================
+
+Falls etwas schiefgeht:
+
+1. Alle offenen Optionen sofort schließen:
+   sqlite3 /root/Projekte/PycharmProjects/AI_TRADING/positions.db << 'EOF'
+   UPDATE options_positions SET status='closed_manual', closed_at=datetime('now') WHERE status='open';
+   SELECT COUNT(*) as closed FROM options_positions WHERE status='closed_manual' AND closed_at IS NOT NULL;
+   EOF
+
+2. OPTIONS_ENABLED ausschalten:
+   nano /root/Projekte/PycharmProjects/AI_TRADING/.env
+   # Setze: OPTIONS_ENABLED=0
+
+3. Services neu starten:
+   sudo systemctl restart trading-scheduler
+
+4. Überprüfen:
+   sudo journalctl -u trading-scheduler -n 5 | grep "OPTIONS_ENABLED"
+   # Sollte "OPTIONS_ENABLED=False" zeigen
+
+
+================================================================================
+SICHERHEITSFEATURES (AUTOMATISCH AKTIV)
+================================================================================
+
+Diese Guards laufen IMMER, auch im Auto-Execute Modus:
+
+1. DTE Guard (Days-to-Expiry):
+   - Optionen werden automatisch geschlossen wenn DTE < 3
+   - Grund: Theta-Decay wird zu aggressiv
+
+2. Premium Stop-Loss:
+   - Wenn Premium < 20% des gekauften Preises → Close
+   - Schutz vor totalen Verlust
+
+3. Premium Take-Profit:
+   - Wenn Premium > 200% des gekauften Preises → Close
+   - Booking von Gewinnen mit 2x Return
+
+4. Circuit Breaker:
+   - Nach 5 Fehler oder 2 Verluste: 30 Minuten Pause
+   - Verhindert Cascade von Fehlern
+
+5. Sektor-Limits (Stock + Options kombiniert):
+   - Max. 30% Portfolio in einem Sektor
+   - Verhindert Über-Konzentration
+
+6. Korrelations-Hedging:
+   - Warnt wenn > 2 Positionen mit >0.85 Korrelation
+   - Kann manuell überschreiben
+
+
+================================================================================
+HÄUFIGE FEHLER & LÖSUNGEN
+================================================================================
+
+FEHLER: "Alpaca API Key nicht gefunden"
+LÖSUNG: .env prüfen:
+   grep -E "ALPACA_API_KEY|ALPACA_API_SECRET" .env
+   # Sollte beide Variablen haben (nicht leer)
+
+---
+
+FEHLER: "No contracts found for AAPL"
+LÖSUNG: DTE-Range prüfen (OPTIONS_DTE_MIN/MAX):
+   # Vielleicht alle Contracts sind außerhalb des Range
+   # Standard: 20-45 DTE, das sollte immer Optionen geben
+
+---
+
+FEHLER: "OptionsPositionMonitor not initialized"
+LÖSUNG: Services neu starten:
+   sudo systemctl restart trading-scheduler
+   sleep 2
+   sudo journalctl -u trading-scheduler -n 10
+
+---
+
+FEHLER: "POP Score too low (0.23 < 0.65)"
+LÖSUNG: Das ist normal! Optionen-Scanner ist selektiv.
+   Nur ~5-15% der Scans führen zu Trades (auch bei Stocks)
+   Das ist GEWÜNSCHT – keine schlechten Trades
+
+
+================================================================================
+PERFORMANCE ERWARTUNGEN (Paper Trading)
+================================================================================
+
+Woche 1: Scanner-Validierung
+- Options-Positions sollten sich aufbauen
+- Erwarte ~1-3 Trades pro Scan (wenn POP >= 0.65)
+- P&L kann +/- sein (das ist normal bei kleinen Positionen)
+
+Metriken im /api/options-status:
+- open_positions: sollte langsam steigen
+- total_pnl: wird variieren
+- last_closed_at: sollte aktualisiert werden
+
+Wenn das 1 Woche stabil läuft → Live-Testing mit echtem Konto
+
+
+================================================================================
+KONTAKT & SUPPORT
+================================================================================
+
+Bei Fragen/Problemen:
+1. Logs prüfen: sudo journalctl -u trading-scheduler -n 100
+2. API-Endpoints testen (siehe Schritt 3)
+3. Datenbank-Schema prüfen (siehe Schritt 3, TEST 4)
+
+Alpaca API Docs:
+- Options Contracts: https://docs.alpaca.markets/api-references/market-data-api/options-data/contracts
+- Options Positions: https://docs.alpaca.markets/api-references/trading-api/positions/
+- OCC Symbol Format: https://en.wikipedia.org/wiki/Option_symbol
+
+================================================================================

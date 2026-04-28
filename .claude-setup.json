@@ -1,0 +1,42 @@
+{
+  "maxSourceFiles": 15,
+  "maxDepth": 6,
+  "maxFileSizeKB": 80,
+  "tokenBudget": {
+    "init": 12000,
+    "sync": 6000,
+    "add": 3000,
+    "remove": 2000
+  },
+  "digestMode": true,
+  "extraBlockedDirs": [],
+  "sourceDirs": [],
+  "truncationRules": {
+    "package-lock.json": {
+      "metadataOnly": true
+    },
+    "Dockerfile": {
+      "maxLines": 50
+    },
+    "docker-compose.yml": {
+      "maxLines": 100,
+      "maxBytes": 8000
+    },
+    "docker-compose.yaml": {
+      "maxLines": 100,
+      "maxBytes": 8000
+    },
+    "pom.xml": {
+      "maxLines": 80
+    },
+    "build.gradle": {
+      "maxLines": 80
+    },
+    "build.gradle.kts": {
+      "maxLines": 80
+    },
+    "setup.py": {
+      "maxLines": 60
+    }
+  }
+}
