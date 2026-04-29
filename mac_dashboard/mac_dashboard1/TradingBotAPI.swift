@@ -10,109 +10,135 @@ struct APIResponse<T: Codable>: Codable, Sendable {
     let data: T
 }
 
-struct Position: Codable, Identifiable, Sendable {
-    var id: UUID = UUID()
+// Alpaca Account Info
+struct AlpacaAccount: Codable, Sendable {
+    let account_number: String
+    let portfolio_value: Double
+    let cash: Double
+    let buying_power: Double
+    let equity: Double
+
+    enum CodingKeys: String, CodingKey {
+        case account_number
+        case portfolio_value
+        case cash
+        case buying_power
+        case equity
+    }
+}
+
+// Portfolio History Response
+struct PortfolioHistoryResponse: Codable {
+    let timestamp: [TimeInterval]
+    let equity: [Double]
+    let profit_loss: [Double]
+    let profit_loss_pct: [Double]
+    let base_value: Double
+    let timeframe: String
+}
+
+// Portfolio History Point
+struct PortfolioHistoryPoint: Identifiable, Sendable {
+    let id = UUID()
+    let date: Date
+    let equity: Double
+    let profitLoss: Double
+    let profitLossPct: Double
+}
+
+// Alpaca Position
+struct AlpacaPosition: Identifiable, Sendable {
     let symbol: String
-    let direction: String  // "long" or "short"
-    let entry_price: Double
-    let quantity: Double
+    let qty: Double
+    let avg_entry_price: Double
     let current_price: Double
-    let pnl_dollar: Double
-    let pnl_percent: Double
-    let stop_loss: Double?
-    let take_profit: Double?
-    let opened_at: String
-    let highest_price: Double?
-    let lowest_price: Double?
-    let atr_14: Double?
-    let kelly_fraction: Double?
+    let unrealized_pl: Double
+    let unrealized_plpc: Double
+
+    var id: String { symbol }
 
     var directionLabel: String {
-        direction.uppercased()
+        qty > 0 ? "LONG" : "SHORT"
+    }
+
+    var direction: String {
+        qty > 0 ? "long" : "short"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case symbol
+        case qty
+        case avg_entry_price
+        case current_price
+        case unrealized_pl
+        case unrealized_plpc
     }
 }
 
-struct PositionsResponse: Codable, Sendable {
-    let positions: [Position]
+extension AlpacaPosition: Decodable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try container.decode(String.self, forKey: .symbol)
+        qty = Double(try container.decode(String.self, forKey: .qty)) ?? 0
+        avg_entry_price = Double(try container.decode(String.self, forKey: .avg_entry_price)) ?? 0
+        current_price = Double(try container.decode(String.self, forKey: .current_price)) ?? 0
+        unrealized_pl = Double(try container.decode(String.self, forKey: .unrealized_pl)) ?? 0
+        unrealized_plpc = Double(try container.decode(String.self, forKey: .unrealized_plpc)) ?? 0
+    }
 }
 
-struct MarketRegime: Codable, Sendable {
-    let regime: String  // "bull", "bear", "neutral"
-    let spy_vs_ema20_pct: Double
-    let qqq_vs_ema20_pct: Double
-    let vix: Double
-}
-
-struct MarketRegimeResponse: Codable, Sendable {
-    let regime: String
-    let spy_vs_ema20_pct: Double
-    let qqq_vs_ema20_pct: Double
-    let vix: Double
-}
-
-struct Trade: Codable, Identifiable, Sendable {
-    var id: UUID = UUID()
+// Alpaca Order (for trades)
+struct AlpacaOrder: Codable, Identifiable, Sendable {
+    let id: String
     let symbol: String
-    let direction: String
-    let entry_price: Double?
-    let quantity: Double
-    let opened_at: String
-    let closed_at: String?
-    let close_price: Double?
-    let pnl: Double?
-    let reason: String
+    let qty: Double
+    let side: String
+    let filled_at: String?
+    let filled_avg_price: Double?
+    let status: String
+    let created_at: String
 
     var isOpen: Bool {
-        closed_at == nil
+        status == "pending_new" || status == "pending_cancel" || status == "pending_replace"
     }
-}
 
-struct TradesResponse: Codable, Sendable {
-    let trades: [Trade]
-}
+    var isClosed: Bool {
+        status == "filled" || status == "canceled" || status == "expired" || status == "rejected"
+    }
 
-struct ScannerStatus: Codable, Sendable {
-    let last_scan: String?
-    let trades_opened_today: Int
-    let status: String
-}
-
-struct ScannerStatusResponse: Codable, Sendable {
-    let last_scan: String?
-    let trades_opened_today: Int
-    let status: String
-}
-
-struct LogsResponse: Codable, Sendable {
-    let logs: [String]
+    enum CodingKeys: String, CodingKey {
+        case id
+        case symbol
+        case qty
+        case side
+        case filled_at
+        case filled_avg_price
+        case status
+        case created_at
+    }
 }
 
 // MARK: - API Client
 
 class TradingBotAPI: NSObject, ObservableObject, URLSessionDelegate {
-    @Published var positions: [Position] = []
-    @Published var marketRegime: MarketRegime?
-    @Published var tradestoday: [Trade] = []
-    @Published var scannerStatus: ScannerStatus?
-    @Published var logs: [String] = []
+    @Published var account: AlpacaAccount?
+    @Published var positions: [AlpacaPosition] = []
+    @Published var trades: [AlpacaOrder] = []
+    @Published var historicalOrders: [AlpacaOrder] = []
+    @Published var portfolioHistory: [PortfolioHistoryPoint] = []
     @Published var isConnected: Bool = false
     @Published var errorMessage: String?
+    @Published var needsCredentials: Bool = false
 
-    private var vpsIP: String
-    private var vpsPort: Int
-    private let refreshInterval: TimeInterval
+    private let alpacaBaseURL = "https://paper-api.alpaca.markets"
+    private let refreshInterval: TimeInterval = 60
     private var refreshTimer: Timer?
     private var session: URLSession!
 
-    init(vpsIP: String = "87.106.167.252", vpsPort: Int = 5000, refreshInterval: TimeInterval = 60) {
-        // Load saved settings from UserDefaults
-        let savedIP = UserDefaults.standard.string(forKey: "vpsIP") ?? vpsIP
-        let savedPort = UserDefaults.standard.integer(forKey: "vpsPort")
+    private var alpacaKey: String?
+    private var alpacaSecret: String?
 
-        self.vpsIP = savedIP
-        self.vpsPort = savedPort > 0 ? savedPort : vpsPort
-        self.refreshInterval = refreshInterval
-
+    override init() {
         super.init()
 
         // Configure URLSession
@@ -123,35 +149,35 @@ class TradingBotAPI: NSObject, ObservableObject, URLSessionDelegate {
 
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
 
-        // Ensure defaults are set for VPS address
-        self.setVPSAddress(ip: "87.106.167.252", port: 5000)
-        if let ats = Bundle.main.infoDictionary?["NSAppTransportSecurity"] {
-            print("ATS settings: \(ats)")
+        // Load credentials from Keychain
+        loadCredentials()
+    }
+
+    // MARK: - Credential Management
+
+    func loadCredentials() {
+        if let (key, secret) = KeychainManager.shared.loadAlpacaCredentials() {
+            self.alpacaKey = key
+            self.alpacaSecret = secret
+            self.needsCredentials = false
+            print("✅ Credentials loaded from Keychain")
+            testConnection()
         } else {
-            print("ATS settings not found in Info.plist")
+            self.needsCredentials = true
+            self.isConnected = false
+            print("⚠️  No Alpaca credentials in Keychain")
         }
-        print("Info.plist path: \(Bundle.main.path(forResource: "Info", ofType: "plist") ?? "nil")")
-
-        // Test connection on init
-        testConnection()
     }
 
-    func setVPSAddress(ip: String, port: Int) {
-        self.vpsIP = ip
-        self.vpsPort = port
-    }
-
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard let trust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.performDefaultHandling, nil)
-            return
+    func setAlpacaCredentials(apiKey: String, apiSecret: String) {
+        if KeychainManager.shared.saveAlpacaCredentials(apiKey: apiKey, apiSecret: apiSecret) {
+            self.alpacaKey = apiKey
+            self.alpacaSecret = apiSecret
+            self.needsCredentials = false
+            testConnection()
+        } else {
+            self.errorMessage = "Failed to save credentials to Keychain"
         }
-        let credential = URLCredential(trust: trust)
-        completionHandler(.useCredential, credential)
-    }
-
-    private var baseURL: String {
-        "http://\(vpsIP):\(vpsPort)"
     }
 
     // MARK: - Public Methods
@@ -170,174 +196,276 @@ class TradingBotAPI: NSObject, ObservableObject, URLSessionDelegate {
     }
 
     func testConnection() {
-        let url = URL(string: "\(baseURL)/api/health")!
-        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        guard let key = alpacaKey, let secret = alpacaSecret else {
+            self.isConnected = false
+            self.needsCredentials = true
+            return
+        }
 
-        print("Testing connection to: \(url.absoluteString)")
+        let url = URL(string: "\(alpacaBaseURL)/v2/account")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
+
+        print("Testing connection to Alpaca API...")
 
         self.session.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 if let error = error {
-                    let nsError = error as NSError
-                    var errorMsg = "Error: \(nsError.domain) [\(nsError.code)] - \(error.localizedDescription)"
-                    if nsError.domain == NSURLErrorDomain && nsError.code == -1022 {
-                        errorMsg = "App Transport Security blocked the request (-1022). Ensure Info.plist allows HTTP to 87.106.167.252:5000."
-                    }
-                    print(errorMsg)
+                    print("❌ Connection error: \(error.localizedDescription)")
                     self?.isConnected = false
-                    self?.errorMessage = errorMsg
+                    self?.errorMessage = "Connection error: \(error.localizedDescription)"
                     return
                 }
 
                 if let httpResponse = response as? HTTPURLResponse {
-                    self?.isConnected = (httpResponse.statusCode == 200)
                     if httpResponse.statusCode == 200 {
-                        print("✓ Connected to API")
+                        print("✅ Connected to Alpaca API")
+                        self?.isConnected = true
+                        self?.errorMessage = nil
+                    } else if httpResponse.statusCode == 401 {
+                        print("❌ Invalid Alpaca credentials (401)")
+                        self?.isConnected = false
+                        self?.errorMessage = "Invalid credentials. Please re-enter."
+                        self?.needsCredentials = true
                     } else {
-                        print("API returned status \(httpResponse.statusCode)")
-                        self?.errorMessage = "API returned status \(httpResponse.statusCode)"
+                        print("❌ Alpaca API returned status \(httpResponse.statusCode)")
+                        self?.isConnected = false
+                        self?.errorMessage = "API error: \(httpResponse.statusCode)"
                     }
-                } else {
-                    self?.isConnected = false
-                    self?.errorMessage = "No response from API"
                 }
             }
         }.resume()
     }
 
     func fetchAll() {
-        testConnection()
+        guard isConnected else { return }
+        fetchAccount()
         fetchPositions()
-        fetchMarketRegime()
-        fetchTradesToday()
-        fetchScannerStatus()
-        fetchLogs()
+        fetchTrades()
+        fetchHistoricalOrders()
+        fetchPortfolioHistory()
+    }
+
+    // MARK: - Alpaca Endpoints
+
+    func fetchAccount() {
+        guard let key = alpacaKey, let secret = alpacaSecret else { return }
+
+        let url = URL(string: "\(alpacaBaseURL)/v2/account")!
+        var request = URLRequest(url: url)
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
+
+        session.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self?.errorMessage = "Failed to fetch account: \(error.localizedDescription)"
+                    return
+                }
+
+                guard let data = data else { return }
+
+                do {
+                    let account = try JSONDecoder().decode(AlpacaAccount.self, from: data)
+                    self?.account = account
+                    self?.errorMessage = nil
+                } catch {
+                    self?.errorMessage = "Failed to decode account data"
+                    print("Decode error: \(error)")
+                }
+            }
+        }.resume()
     }
 
     func fetchPositions() {
-        fetch(endpoint: "/api/positions") { (response: APIResponse<PositionsResponse>) in
-            DispatchQueue.main.async {
-                self.positions = response.data.positions
-                self.errorMessage = nil
-            }
-        }
-    }
+        guard let key = alpacaKey, let secret = alpacaSecret else { return }
 
-    func fetchMarketRegime() {
-        fetch(endpoint: "/api/market-regime") { (response: APIResponse<MarketRegimeResponse>) in
-            DispatchQueue.main.async {
-                self.marketRegime = MarketRegime(
-                    regime: response.data.regime,
-                    spy_vs_ema20_pct: response.data.spy_vs_ema20_pct,
-                    qqq_vs_ema20_pct: response.data.qqq_vs_ema20_pct,
-                    vix: response.data.vix
-                )
-                self.errorMessage = nil
-            }
-        }
-    }
-
-    func fetchTradesToday() {
-        fetch(endpoint: "/api/trades-today") { (response: APIResponse<TradesResponse>) in
-            DispatchQueue.main.async {
-                self.tradestoday = response.data.trades
-                self.errorMessage = nil
-            }
-        }
-    }
-
-    func fetchScannerStatus() {
-        fetch(endpoint: "/api/scanner-status") { (response: APIResponse<ScannerStatusResponse>) in
-            DispatchQueue.main.async {
-                self.scannerStatus = ScannerStatus(
-                    last_scan: response.data.last_scan,
-                    trades_opened_today: response.data.trades_opened_today,
-                    status: response.data.status
-                )
-                self.errorMessage = nil
-            }
-        }
-    }
-
-    func fetchLogs() {
-        fetch(endpoint: "/api/logs/tail") { (response: APIResponse<LogsResponse>) in
-            DispatchQueue.main.async {
-                self.logs = response.data.logs
-                self.errorMessage = nil
-            }
-        }
-    }
-
-    func triggerManualScan() {
-        let url = URL(string: "\(baseURL)/api/trigger-scan")!
+        let url = URL(string: "\(alpacaBaseURL)/v2/positions")!
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
 
-        self.session.dataTask(with: request) { [weak self] _, response, error in
+        session.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
-                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-                    self?.errorMessage = "Scan triggered (results in 30-60s)"
-                } else {
-                    self?.errorMessage = error?.localizedDescription ?? "Failed to trigger scan"
+                if let error = error {
+                    self?.errorMessage = "Failed to fetch positions: \(error.localizedDescription)"
+                    return
                 }
-            }
-        }.resume()
-    }
 
-    // MARK: - Private Helper
+                guard let data = data else { return }
 
-    private func fetch<T: Codable>(endpoint: String, completion: @escaping (T) -> Void) {
-        let url = URL(string: "\(baseURL)\(endpoint)")!
-        print("DEBUG: Request URL = \(url.absoluteString)")
-        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-
-        self.session.dataTask(with: request) { [weak self] data, response, error in
-            guard let data = data, error == nil else {
-                DispatchQueue.main.async {
-                    if let nsError = error as NSError?, nsError.domain == NSURLErrorDomain && nsError.code == -1022 {
-                        self?.errorMessage = "ATS blocked HTTP (-1022). Check Info.plist App Transport Security settings for 87.106.167.252:5000."
-                    } else {
-                        self?.errorMessage = error?.localizedDescription ?? "Network error"
+                do {
+                    let positions = try JSONDecoder().decode([AlpacaPosition].self, from: data)
+                    self?.positions = positions.sorted { $0.unrealized_pl > $1.unrealized_pl }
+                    print("✅ Loaded \(positions.count) positions")
+                    self?.errorMessage = nil
+                } catch {
+                    self?.errorMessage = "Failed to decode positions"
+                    print("❌ Position decode error: \(error)")
+                    if let data = String(data: data, encoding: .utf8) {
+                        print("Response: \(data.prefix(500))")
                     }
                 }
-                return
             }
+        }.resume()
+    }
 
-            do {
-                let decoded = try JSONDecoder().decode(T.self, from: data)
-                completion(decoded)
-            } catch {
-                DispatchQueue.main.async {
-                    self?.errorMessage = "Decode error: \(error.localizedDescription)"
+    func fetchTrades() {
+        guard let key = alpacaKey, let secret = alpacaSecret else { return }
+
+        // Get today's date
+        let todayStart = Calendar.current.startOfDay(for: Date())
+        let dateFormatter = ISO8601DateFormatter()
+        let todayISO = dateFormatter.string(from: todayStart)
+
+        var urlComponents = URLComponents(string: "\(alpacaBaseURL)/v2/orders")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "status", value: "closed"),
+            URLQueryItem(name: "limit", value: "20"),
+            URLQueryItem(name: "after", value: todayISO)
+        ]
+
+        guard let url = urlComponents.url else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
+
+        session.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self?.errorMessage = "Failed to fetch trades: \(error.localizedDescription)"
+                    return
+                }
+
+                guard let data = data else { return }
+
+                do {
+                    let trades = try JSONDecoder().decode([AlpacaOrder].self, from: data)
+                    self?.trades = trades.sorted {
+                        let date1 = ISO8601DateFormatter().date(from: $0.created_at) ?? Date.distantPast
+                        let date2 = ISO8601DateFormatter().date(from: $1.created_at) ?? Date.distantPast
+                        return date1 > date2
+                    }
+                    self?.errorMessage = nil
+                } catch {
+                    self?.errorMessage = "Failed to decode trades"
+                    print("Decode error: \(error)")
                 }
             }
         }.resume()
     }
-}
-@MainActor
-extension Position {
-    var pnlColor: Color {
-        pnl_dollar >= 0 ? .green : .red
-    }
-}
 
-@MainActor
-extension MarketRegime {
-    var regimeColor: Color {
-        switch regime {
-        case "bull": return .green
-        case "bear": return .red
-        default: return .gray
+    func fetchHistoricalOrders() {
+        guard let key = alpacaKey, let secret = alpacaSecret else { return }
+
+        var urlComponents = URLComponents(string: "\(alpacaBaseURL)/v2/orders")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "status", value: "closed"),
+            URLQueryItem(name: "limit", value: "100")
+        ]
+
+        guard let url = urlComponents.url else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
+
+        session.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("Failed to fetch historical orders: \(error.localizedDescription)")
+                    return
+                }
+
+                guard let data = data else { return }
+
+                do {
+                    let orders = try JSONDecoder().decode([AlpacaOrder].self, from: data)
+                    self?.historicalOrders = orders
+                    print("✅ Loaded \(orders.count) historical orders")
+                } catch {
+                    print("Failed to decode historical orders: \(error)")
+                }
+            }
+        }.resume()
+    }
+
+    func fetchPortfolioHistory() {
+        guard let key = alpacaKey, let secret = alpacaSecret else {
+            print("⚠️ No credentials for portfolio history")
+            return
         }
+
+        var urlComponents = URLComponents(string: "\(alpacaBaseURL)/v2/account/portfolio/history")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "period", value: "1M"),
+            URLQueryItem(name: "timeframe", value: "1D"),
+            URLQueryItem(name: "intraday_reporting", value: "market_hours")
+        ]
+
+        guard let url = urlComponents.url else {
+            print("⚠️ Invalid portfolio history URL")
+            return
+        }
+
+        print("📊 Fetching portfolio history from: \(url.absoluteString)")
+
+        var request = URLRequest(url: url)
+        request.setValue(key, forHTTPHeaderField: "APCA-API-KEY-ID")
+        request.setValue(secret, forHTTPHeaderField: "APCA-API-SECRET-KEY")
+
+        session.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("❌ Failed to fetch portfolio history: \(error.localizedDescription)")
+                    return
+                }
+
+                if let httpResponse = response as? HTTPURLResponse {
+                    print("📊 Portfolio history response code: \(httpResponse.statusCode)")
+                }
+
+                guard let data = data else {
+                    print("⚠️ No data in portfolio history response")
+                    return
+                }
+
+                do {
+                    let response = try JSONDecoder().decode(PortfolioHistoryResponse.self, from: data)
+                    let history = zip(response.timestamp, response.equity).enumerated().map { index, values in
+                        let (timestamp, equity) = values
+                        let profitLoss = response.profit_loss[index]
+                        let profitLossPct = response.profit_loss_pct[index]
+                        return PortfolioHistoryPoint(
+                            date: Date(timeIntervalSince1970: timestamp),
+                            equity: equity,
+                            profitLoss: profitLoss,
+                            profitLossPct: profitLossPct
+                        )
+                    }
+                    print("✅ Loaded portfolio history: \(history.count) data points")
+                    self?.portfolioHistory = history
+                } catch {
+                    print("❌ Failed to decode portfolio history: \(error)")
+                    if let data = String(data: data, encoding: .utf8) {
+                        print("Response data: \(data.prefix(200))")
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    // MARK: - URLSessionDelegate
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        let credential = URLCredential(trust: trust)
+        completionHandler(.useCredential, credential)
     }
 }
-
-@MainActor
-extension Trade {
-    var pnlColor: Color {
-        guard let pnl = pnl else { return .gray }
-        return pnl >= 0 ? .green : .red
-    }
-}
-
