@@ -122,9 +122,6 @@ class CacheManager:
 class DataFetcher:
     """Fetches OHLCV, IV, and market data from Alpaca"""
 
-    BASE_URL = "https://api.alpaca.markets"
-    DATA_BASE_URL = "https://data.alpaca.markets"
-
     def __init__(self):
         self.api_key = os.getenv("APCA_API_KEY_ID")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY")
@@ -133,6 +130,10 @@ class DataFetcher:
             raise ValueError(
                 "Missing Alpaca credentials: APCA_API_KEY_ID or APCA_API_SECRET_KEY"
             )
+
+        # Read API URLs from environment, use defaults if not set
+        self.BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+        self.DATA_BASE_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
@@ -164,11 +165,12 @@ class DataFetcher:
         url = f"{self.DATA_BASE_URL}/v2/stocks/bars"
         params = {
             "symbols": symbol,
-            "timeframe": "1h",
+            "timeframe": "1Hour",
             "start": start_time.isoformat().replace("+00:00", "Z"),
             "end": end_time.isoformat().replace("+00:00", "Z"),
             "limit": limit,
             "adjustment": "all",
+            "feed": "iex",  # Use free IEX data feed
         }
 
         for attempt in range(retry_count):
@@ -243,11 +245,12 @@ class DataFetcher:
         url = f"{self.DATA_BASE_URL}/v2/stocks/bars"
         params = {
             "symbols": symbol,
-            "timeframe": "1d",
+            "timeframe": "1Day",
             "start": start_time.isoformat().replace("+00:00", "Z"),
             "end": end_time.isoformat().replace("+00:00", "Z"),
             "limit": limit,
             "adjustment": "all",
+            "feed": "iex",  # Use free IEX data feed
         }
 
         for attempt in range(retry_count):

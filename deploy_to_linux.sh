@@ -30,7 +30,7 @@ rsync -avz \
   --exclude='.venv' \
   --exclude='.git' \
   --exclude='*.db' \
-  $LOCAL_PATH/ $SERVER:$REMOTE_PATH/
+  "$LOCAL_PATH/" "$SERVER:$REMOTE_PATH/"
 
 # Step 3: Install dependencies (if needed)
 echo "[3/5] Ensuring Python dependencies..."
