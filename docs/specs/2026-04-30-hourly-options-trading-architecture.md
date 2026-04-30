@@ -256,44 +256,181 @@ def _detect_trend(self, hourly: IndicatorSet, daily: IndicatorSet) -> str:
 
 **Verantwortlichkeit:** Signale generieren basierend auf Indikatoren, entscheiden welche Strategie
 
+#### Decision Tree für Strategie-Auswahl
+
+```
+IF hourly_bullish AND daily_bullish:
+  confidence = _calculate_signal_strength()
+  IF confidence < 0.50:
+    → SKIP
+  ELIF iv_rank < 40:
+    → BULL_CALL_SPREAD (kaufe günstig bei niedriger IV)
+  ELIF iv_rank > 60:
+    → BEAR_PUT_SPREAD (verkaufe bei hoher IV, Theta)
+  ELSE:
+    → SKIP (mittlere IV, kein Vorteil)
+
+ELIF hourly_neutral AND daily_bullish:
+  IF iv_rank > 60:
+    → BEAR_PUT_SPREAD (Theta farmer, 45+ DTE)
+  ELIF iv_rank < 30:
+    → CALENDAR_SPREAD (mean-reversion play)
+  ELSE:
+    → SKIP
+
+ELIF hourly_bullish AND daily_neutral:
+  IF iv_rank > 60:
+    → BEAR_PUT_SPREAD (conservative)
+  ELSE:
+    → SKIP
+
+ELIF bestehende_aktien_position:
+  IF position_unrealized_pl > 0:
+    → PROTECTIVE_PUT (sichern die Gewinne)
+  ELIF position_unrealized_pl < 0 AND daily_bullish:
+    → COVERED_CALL (cashflow generieren)
+  ELSE:
+    → SKIP
+
+ELSE (bearish oder neutral ohne Setup):
+  → SKIP
+```
+
+#### Code-Implementierung
+
 ```python
 class StrategyEngine:
     def __init__(self):
-        self.options_agent = OptionsAgent()  # Reuse existing
+        self.options_agent = OptionsAgent()
     
     def generate_signals(self, indicators: Dict[str, Analysis], 
-                        market_data: Dict[str, MarketData]) -> List[Signal]:
+                        market_data: Dict[str, MarketData],
+                        current_positions: Dict[str, Position]) -> List[Signal]:
         """Generiert Signale für jedes Symbol"""
         signals = []
         
         for symbol, analysis in indicators.items():
-            signal = self._decide_strategy(symbol, analysis, market_data[symbol])
+            # Check if we have existing position
+            existing = current_positions.get(symbol)
+            
+            signal = self._decide_strategy(
+                symbol=symbol,
+                analysis=analysis,
+                data=market_data[symbol],
+                current_position=existing
+            )
+            
             if signal:
                 signals.append(signal)
         
         return signals
     
     def _decide_strategy(self, symbol: str, analysis: Analysis, 
-                        data: MarketData) -> Optional[Signal]:
+                        data: MarketData, 
+                        current_position: Optional[Position] = None) -> Optional[Signal]:
         """
-        Logik:
-        1. Ist hourly stark + daily positiv? → BULL_CALL_SPREAD
-        2. Ist hourly schwach + daily positiv? → PROTECTIVE_PUT (für existing stock)
-        3. Ist hourly stark + daily negativ? → BEAR_PUT_SPREAD
-        4. Ist hourly schwach + daily negativ? → STAY_OUT
+        Entscheidungslogik: Welche Strategie?
         """
         
-        hourly_trend = analysis.hourly_signal  # -1, 0, 1
+        # Schritt 1: Signal-Stärke prüfen
+        confidence = self._calculate_signal_strength(analysis)
+        if confidence < 0.50:
+            return None
+        
+        # Schritt 2: Haben wir bereits Aktien in diesem Symbol?
+        if current_position and current_position.qty > 0:
+            return self._decide_hedge_strategy(symbol, analysis, current_position)
+        
+        # Schritt 3: Neue Trades
+        hourly_trend = analysis.hourly_signal
         daily_trend = analysis.daily_signal
+        iv_rank = data.iv_rank
         
+        # --- BULLISH + BULLISH ---
         if hourly_trend > 0 and daily_trend > 0:
-            return self._build_bull_call_spread(symbol, analysis, data)
-        elif hourly_trend > 0 and daily_trend < 0:
-            return self._build_protective_put(symbol, analysis, data)
-        elif hourly_trend < 0 and daily_trend < 0:
-            return self._build_bear_put_spread(symbol, analysis, data)
+            if iv_rank < 40:
+                return self._build_bull_call_spread(symbol, analysis, data, confidence)
+            elif iv_rank > 60:
+                return self._build_bear_put_spread(symbol, analysis, data, confidence)
+            else:
+                return None  # Medium IV
+        
+        # --- NEUTRAL HOURLY + BULLISH DAILY ---
+        elif hourly_trend == 0 and daily_trend > 0:
+            if iv_rank > 60:
+                return self._build_bear_put_spread(symbol, analysis, data, confidence)
+            elif iv_rank < 30:
+                return self._build_calendar_spread(symbol, analysis, data)
+            else:
+                return None
+        
+        # --- BULLISH HOURLY + NEUTRAL DAILY ---
+        elif hourly_trend > 0 and daily_trend == 0:
+            if iv_rank > 60:
+                return self._build_bear_put_spread(symbol, analysis, data, confidence)
+            else:
+                return None
+        
+        # --- BEARISH or other combinations ---
         else:
-            return None  # Hold, no signal
+            return None
+    
+    def _decide_hedge_strategy(self, symbol: str, analysis: Analysis,
+                              position: Position) -> Optional[Signal]:
+        """Wenn wir Aktien haben: hedgen oder covered call"""
+        
+        if position.unrealized_pnl > 0:
+            # Gewinne schützen
+            return self._build_protective_put(symbol, analysis, position)
+        elif position.unrealized_pnl < 0 and analysis.daily_signal > 0:
+            # Verlust-Position aber daily trend noch bullish → cashflow
+            return self._build_covered_call(symbol, analysis, position)
+        else:
+            return None
+    
+    def _calculate_signal_strength(self, analysis: Analysis) -> float:
+        """Kombiniert RSI, MACD, EMA zu Confidence Score"""
+        score = 0.5
+        
+        # RSI component
+        rsi = analysis.hourly.rsi_14
+        if rsi > 70:
+            score += 0.20
+        elif rsi > 60:
+            score += 0.10
+        elif rsi < 30:
+            score -= 0.20
+        elif rsi < 40:
+            score -= 0.10
+        
+        # MACD component
+        if analysis.hourly.macd_value > analysis.hourly.macd_signal:
+            score += 0.15
+        else:
+            score -= 0.15
+        
+        # EMA alignment (trend confirmation)
+        if (analysis.hourly.ema_20 > analysis.hourly.ema_50 > 
+            analysis.hourly.ema_200):
+            score += 0.10
+        
+        # Daily confirmation (extra weight)
+        if analysis.daily_signal > 0:
+            score += 0.10
+        
+        return max(0.0, min(1.0, score))
+```
+
+#### Supported Strategien (mit Trigger-Bedingungen)
+
+| Strategie | Trigger | Target | Stop | Time Exit |
+|-----------|---------|--------|------|-----------|
+| **BULL_CALL_SPREAD** | Hourly ↑ + Daily ↑ + IV < 40 | 33% of max profit | 50% of max risk | 2h |
+| **BEAR_PUT_SPREAD** | Hourly ↑/→ + Daily ↑ + IV > 60 | 80% of credit | 50% of credit | 4h |
+| **CALENDAR_SPREAD** | Hourly → + Daily ↑ + IV < 30 | 50% of credit | Max risk | 21 DTE |
+| **PROTECTIVE_PUT** | Existing position + PnL > 0 | Position profit | Cost of put | Expires |
+| **COVERED_CALL** | Existing position + PnL < 0 + Daily ↑ | Income + position | Position | 30 DTE |
+| **DIRECTIONAL_CALL** | Hourly ↑↑ (RSI>70) + Daily ↑ + IV < 30 | 50% profit | 100% loss | 1h |
     
     def _build_bull_call_spread(self, symbol: str, 
                                analysis: Analysis, 
