@@ -19,6 +19,7 @@ from data_fetcher import DataFetcher
 from analytics_engine import AnalyticsEngine
 from strategy_engine import StrategyEngine
 from risk_manager import RiskManager, PositionRisk
+from execution_engine import ExecutionEngine
 
 
 @dataclass
@@ -55,6 +56,7 @@ class TradingOrchestrator:
         self.analytics_engine = AnalyticsEngine()
         self.strategy_engine = StrategyEngine()
         self.risk_manager = RiskManager(account_size=account_size)
+        self.execution_engine = ExecutionEngine(paper_trading=True)
 
         # State
         self.open_positions: List[PositionRisk] = []
@@ -184,12 +186,32 @@ class TradingOrchestrator:
                         continue
 
                     valid_signals.append(signal)
-                    result.signals_executed += 1
 
                 except Exception as e:
                     self.logger.error(f"[{cycle_id}] {symbol} processing error: {e}")
                     result.errors.append(f"{symbol}: {str(e)[:50]}")
                     continue
+
+            # Step 4.5: Execute valid signals with ExecutionEngine (Paper Trading)
+            for signal in valid_signals:
+                try:
+                    exec_result = self.execution_engine.execute_signal(
+                        signal=signal,
+                        cycle_id=cycle_id,
+                        current_bid=signal.current_price * 0.995 if signal.current_price else None,
+                        current_ask=signal.current_price * 1.005 if signal.current_price else None,
+                    )
+
+                    if exec_result.executed:
+                        result.signals_executed += 1
+                        self.logger.info(f"[{cycle_id}] {signal.symbol} trade executed: {exec_result.trade_id}")
+                    else:
+                        result.signals_rejected += 1
+                        self.logger.warning(f"[{cycle_id}] {signal.symbol} execution failed: {exec_result.reason}")
+
+                except Exception as e:
+                    result.signals_rejected += 1
+                    self.logger.error(f"[{cycle_id}] Execution error for {signal.symbol}: {e}")
 
             # Step 5: Update portfolio state
             if self.open_positions:
@@ -257,6 +279,32 @@ class TradingOrchestrator:
             "signals_rejected": self.last_cycle_result.signals_rejected,
             "duration_seconds": round(self.last_cycle_result.duration_seconds, 2),
             "errors": self.last_cycle_result.errors,
+        }
+
+    def get_paper_trading_stats(self) -> Dict[str, Any]:
+        """Get paper trading performance statistics"""
+        pnl = self.execution_engine.get_portfolio_pnl()
+        stats = self.execution_engine.get_trade_statistics()
+
+        return {
+            "paper_trading": True,
+            "pnl": {
+                "realized": round(pnl["realized_pnl"], 2),
+                "unrealized": round(pnl["unrealized_pnl"], 2),
+                "total": round(pnl["total_pnl"], 2),
+                "closed_trades": pnl["closed_trades"],
+                "open_trades": pnl["open_trades"],
+            },
+            "statistics": {
+                "total_trades": stats["total_trades"],
+                "win_rate": round(stats["win_rate"], 2),
+                "avg_win": round(stats["avg_win"], 2),
+                "avg_loss": round(stats["avg_loss"], 2),
+                "profit_factor": round(stats["profit_factor"], 2),
+                "largest_win": round(stats["largest_win"], 2),
+                "largest_loss": round(stats["largest_loss"], 2),
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 

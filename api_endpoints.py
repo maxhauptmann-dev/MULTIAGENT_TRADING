@@ -91,6 +91,13 @@ class OrchestratorAPI:
 
             return jsonify(limits)
 
+        # Paper Trading endpoints
+        @self.app.route("/paper_trading/stats", methods=["GET"])
+        def paper_trading_stats():
+            """Get paper trading performance statistics"""
+            stats = self.orchestrator.get_paper_trading_stats()
+            return jsonify(stats)
+
     def _get_signals_last_hour(self) -> Dict[str, Any]:
         """Query signals from last hour"""
         try:
