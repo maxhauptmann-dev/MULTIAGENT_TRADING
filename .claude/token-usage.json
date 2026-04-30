@@ -1,22 +1,22 @@
 [
   {
     "sessionId": "e4426137-3b14-4583-bd64-c23ba9f8e98f",
-    "timestamp": "2026-04-29T14:28:40.761Z",
+    "timestamp": "2026-04-30T10:11:39.047Z",
     "model": "claude-haiku-4-5-20251001",
-    "inputTokens": 9613,
-    "outputTokens": 582863,
-    "cacheCreate": 4146853,
-    "cacheRead": 127202953,
-    "cost": 22.38519212,
+    "inputTokens": 10198,
+    "outputTokens": 645163,
+    "cacheCreate": 4498624,
+    "cacheRead": 134903113,
+    "cost": 23.602643920000002,
     "modelBreakdowns": [
       {
         "model": "claude-haiku-4-5-20251001",
-        "inputTokens": 9550,
-        "outputTokens": 545618,
-        "cacheCreate": 3378667,
-        "cacheRead": 125030034,
-        "cost": 15.57118172,
-        "totalTokens": 128963869
+        "inputTokens": 10135,
+        "outputTokens": 607918,
+        "cacheCreate": 3730438,
+        "cacheRead": 132730194,
+        "cost": 16.78863352,
+        "totalTokens": 137078685
       },
       {
         "model": "claude-sonnet-4-6",
