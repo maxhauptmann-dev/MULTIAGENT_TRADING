@@ -5,6 +5,8 @@ Uses Ask-Entry (worst-case) and Mid-Price Exit for realistic P&L.
 """
 
 import logging
+import sqlite3
+import json
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -84,8 +86,9 @@ class ExecutionEngine:
     - Spread: Bid-Ask from current market
     """
 
-    def __init__(self, paper_trading: bool = True):
+    def __init__(self, paper_trading: bool = True, db_path: str = "trading.db"):
         self.paper_trading = paper_trading
+        self.db_path = db_path
         self.trades: Dict[str, ExecutedTrade] = {}
         self.trade_counter = 0
         self.logger = logging.getLogger(__name__)
@@ -153,6 +156,7 @@ class ExecutionEngine:
         )
 
         self.trades[trade_id] = trade
+        self._save_trade_to_db(trade)
 
         self.logger.info(
             f"[EXECUTION] {signal.symbol} {signal.strategy.value} @ ${entry_price:.2f} "
@@ -206,6 +210,9 @@ class ExecutionEngine:
             f"[CLOSE] {trade_id}: {trade.symbol} @ ${exit_price:.2f} "
             f"P&L: ${total_pnl:.2f} ({pnl_percent:+.2f}%)"
         )
+
+        # Save to database
+        self._save_trade_to_db(trade)
 
         return True, total_pnl
 
@@ -271,6 +278,43 @@ class ExecutionEngine:
             "largest_win": max((t.realized_pnl for t in winning), default=0),
             "largest_loss": min((t.realized_pnl for t in losing), default=0),
         }
+
+    # -------- Database --------
+
+    def _save_trade_to_db(self, trade: ExecutedTrade) -> bool:
+        """Save trade to executed_strategies table"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO executed_strategies
+                (symbol, strategy, direction, contracts, entry_price, entry_timestamp,
+                 exit_price, exit_timestamp, pnl, pnl_percent, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.symbol,
+                    trade.strategy.value,
+                    trade.direction,
+                    trade.contracts,
+                    trade.entry_price,
+                    trade.entry_time.isoformat(),
+                    trade.exit_price,
+                    trade.exit_time.isoformat() if trade.exit_time else None,
+                    trade.realized_pnl,
+                    trade.pnl_percent,
+                    trade.status.value,
+                    trade.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error saving trade to DB: {e}")
+            return False
 
     # -------- Helpers --------
 

@@ -98,6 +98,79 @@ class OrchestratorAPI:
             stats = self.orchestrator.get_paper_trading_stats()
             return jsonify(stats)
 
+        @self.app.route("/paper_trading/trades", methods=["GET"])
+        def paper_trading_trades():
+            """Get all executed trades from database"""
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    """
+                    SELECT symbol, strategy, direction, contracts,
+                           entry_price, entry_timestamp, exit_price, exit_timestamp,
+                           pnl, pnl_percent, status, created_at
+                    FROM executed_strategies
+                    ORDER BY created_at DESC
+                    LIMIT 100
+                    """
+                )
+
+                trades = [dict(row) for row in cursor.fetchall()]
+                conn.close()
+
+                return jsonify({
+                    "trades": trades,
+                    "count": len(trades),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                return jsonify({"error": str(e), "trades": []}), 500
+
+        @self.app.route("/paper_trading/closed_trades", methods=["GET"])
+        def paper_trading_closed_trades():
+            """Get closed trades (P&L summary)"""
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    """
+                    SELECT symbol, strategy, direction, contracts,
+                           entry_price, exit_price, pnl, pnl_percent,
+                           exit_timestamp
+                    FROM executed_strategies
+                    WHERE status = 'closed'
+                    ORDER BY exit_timestamp DESC
+                    LIMIT 50
+                    """
+                )
+
+                trades = [dict(row) for row in cursor.fetchall()]
+
+                # Calculate summary
+                total_pnl = sum(t['pnl'] or 0 for t in trades)
+                wins = len([t for t in trades if (t['pnl'] or 0) > 0])
+                losses = len([t for t in trades if (t['pnl'] or 0) < 0])
+
+                conn.close()
+
+                return jsonify({
+                    "closed_trades": trades,
+                    "count": len(trades),
+                    "summary": {
+                        "total_pnl": round(total_pnl, 2),
+                        "wins": wins,
+                        "losses": losses,
+                        "win_rate": round(wins / len(trades) * 100, 2) if trades else 0,
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                return jsonify({"error": str(e), "closed_trades": []}), 500
+
     def _get_signals_last_hour(self) -> Dict[str, Any]:
         """Query signals from last hour"""
         try:
