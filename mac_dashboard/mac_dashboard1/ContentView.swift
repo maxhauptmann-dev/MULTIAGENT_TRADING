@@ -5,123 +5,151 @@ struct ContentView: View {
     @StateObject private var api = TradingBotAPI()
     @State private var showSettings = false
     @State private var showCredentialModal = false
+    @State private var selectedTab: TabType = .pnl
+
+    enum TabType {
+        case pnl
+        case positions
+        case trades
+        case settings
+    }
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 16) {
-                // Header
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Trading Dashboard")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundColor(.white)
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(api.isConnected ? Color(red: 0.34, green: 0.85, blue: 0.34) : Color(red: 0.86, green: 0.27, blue: 0.27))
-                                .frame(width: 8, height: 8)
-                            Text(api.isConnected ? "Connected to Alpaca" : "Disconnected")
+            VStack(spacing: 0) {
+                // Top Header
+                VStack(spacing: 16) {
+                    // Header
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Trading Dashboard")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundColor(.white)
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(api.isConnected ? Color(red: 0.34, green: 0.85, blue: 0.34) : Color(red: 0.86, green: 0.27, blue: 0.27))
+                                    .frame(width: 8, height: 8)
+                                Text(api.isConnected ? "Connected to Alpaca" : "Disconnected")
+                                    .font(.caption)
+                                    .foregroundColor(api.isConnected ? Color(red: 0.34, green: 0.85, blue: 0.34) : Color(red: 0.86, green: 0.27, blue: 0.27))
+                            }
+                        }
+
+                        Spacer()
+
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(lastUpdateTime())
                                 .font(.caption)
-                                .foregroundColor(api.isConnected ? Color(red: 0.34, green: 0.85, blue: 0.34) : Color(red: 0.86, green: 0.27, blue: 0.27))
+                                .foregroundColor(.gray)
+                                .opacity(0.7)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color(red: 0.08, green: 0.09, blue: 0.11))
+                    .border(Color(red: 0.15, green: 0.25, blue: 0.55), width: 1)
+                    .cornerRadius(12)
+                }
+                .padding(16)
+
+                // Tab Content
+                VStack(spacing: 16) {
+
+                    // Error banner
+                    if let error = api.errorMessage {
+                        HStack {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundColor(Color(red: 0.86, green: 0.27, blue: 0.27))
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.white)
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(12)
+                        .background(Color(red: 0.86, green: 0.27, blue: 0.27).opacity(0.15))
+                        .border(Color(red: 0.86, green: 0.27, blue: 0.27), width: 1)
+                        .cornerRadius(8)
+                    }
+
+                    if api.needsCredentials {
+                        CredentialModalView(api: api, isPresented: $showCredentialModal)
+                            .frame(maxHeight: 200)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 16) {
+                                // Tab-based content
+                                switch selectedTab {
+                                case .pnl:
+                                    // Account Summary
+                                    if let account = api.account {
+                                        let totalUnrealizedPnL = api.positions.reduce(0) { $0 + $1.unrealized_pl }
+                                        AccountSummaryCard(account: account, unrealizedPnL: totalUnrealizedPnL)
+                                    }
+
+                                    // Performance Stats
+                                    if !api.historicalOrders.isEmpty || !api.portfolioHistory.isEmpty {
+                                        PerformanceStatsView(historicalOrders: api.historicalOrders, portfolioHistory: api.portfolioHistory)
+                                    }
+
+                                    // P&L Chart
+                                    if !api.portfolioHistory.isEmpty {
+                                        OverallPnLChart(history: api.portfolioHistory)
+                                    } else {
+                                        PlaceholderChart(title: "Overall P&L", subtitle: "Loading portfolio data...")
+                                    }
+
+                                    // Daily P&L Chart
+                                    if !api.portfolioHistory.isEmpty {
+                                        DailyPnLChart(history: api.portfolioHistory)
+                                    }
+
+                                    // Equity Chart
+                                    if !api.portfolioHistory.isEmpty {
+                                        EquityChart(history: api.portfolioHistory)
+                                    } else {
+                                        PlaceholderChart(title: "Mark-to-Market Holdings", subtitle: "Loading portfolio data...")
+                                    }
+
+                                case .positions:
+                                    // Positions overview
+                                    if let account = api.account {
+                                        let totalUnrealizedPnL = api.positions.reduce(0) { $0 + $1.unrealized_pl }
+                                        AccountSummaryCard(account: account, unrealizedPnL: totalUnrealizedPnL)
+                                    }
+
+                                    // Position Pie Chart
+                                    if !api.positions.isEmpty {
+                                        PositionPieChart(positions: api.positions)
+                                    } else {
+                                        PlaceholderChart(title: "Position Distribution", subtitle: "No open positions")
+                                    }
+
+                                    // Positions Table
+                                    PositionsTableView(positions: api.positions)
+
+                                case .trades:
+                                    // Trade Analytics
+                                    if !api.historicalOrders.isEmpty || !api.trades.isEmpty {
+                                        TradeAnalyticsView(historicalOrders: api.historicalOrders, trades: api.trades)
+                                    }
+
+                                    // Trades Today
+                                    TradesView(trades: api.trades)
+
+                                case .settings:
+                                    SettingsView(api: api)
+                                }
+                            }
                         }
                     }
 
                     Spacer()
-
-                    VStack(alignment: .trailing, spacing: 4) {
-                        Text(lastUpdateTime())
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                            .opacity(0.7)
-                        Button(action: { showSettings = true }) {
-                            Image(systemName: "gear")
-                                .foregroundColor(Color(red: 0.4, green: 0.6, blue: 1.0))
-                                .font(.system(size: 14, weight: .semibold))
-                        }
-                        .popover(isPresented: $showSettings) {
-                            SettingsView(api: api)
-                        }
-                    }
                 }
                 .padding(16)
-                .background(Color(red: 0.08, green: 0.09, blue: 0.11))
-                .border(Color(red: 0.15, green: 0.25, blue: 0.55), width: 1)
-                .cornerRadius(12)
 
-                // Error banner
-                if let error = api.errorMessage {
-                    HStack {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .foregroundColor(Color(red: 0.86, green: 0.27, blue: 0.27))
-                        Text(error)
-                            .font(.caption)
-                            .foregroundColor(.white)
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(12)
-                    .background(Color(red: 0.86, green: 0.27, blue: 0.27).opacity(0.15))
-                    .border(Color(red: 0.86, green: 0.27, blue: 0.27), width: 1)
-                    .cornerRadius(8)
-                }
-
-                if api.needsCredentials {
-                    CredentialModalView(api: api, isPresented: $showCredentialModal)
-                        .frame(maxHeight: 200)
-                } else {
-                    ScrollView {
-                        VStack(spacing: 16) {
-                            // Account Summary
-                            if let account = api.account {
-                                let totalUnrealizedPnL = api.positions.reduce(0) { $0 + $1.unrealized_pl }
-                                AccountSummaryCard(account: account, unrealizedPnL: totalUnrealizedPnL)
-                            }
-
-                            // Performance Stats
-                            if !api.historicalOrders.isEmpty || !api.portfolioHistory.isEmpty {
-                                PerformanceStatsView(historicalOrders: api.historicalOrders, portfolioHistory: api.portfolioHistory)
-                            }
-
-                            // P&L Chart
-                            if !api.portfolioHistory.isEmpty {
-                                OverallPnLChart(history: api.portfolioHistory)
-                            } else {
-                                PlaceholderChart(title: "Overall P&L", subtitle: "Loading portfolio data...")
-                            }
-
-                            // Daily P&L Chart
-                            if !api.portfolioHistory.isEmpty {
-                                DailyPnLChart(history: api.portfolioHistory)
-                            }
-
-                            // Equity Chart
-                            if !api.portfolioHistory.isEmpty {
-                                EquityChart(history: api.portfolioHistory)
-                            } else {
-                                PlaceholderChart(title: "Mark-to-Market Holdings", subtitle: "Loading portfolio data...")
-                            }
-
-                            // Position Pie Chart
-                            if !api.positions.isEmpty {
-                                PositionPieChart(positions: api.positions)
-                            }
-
-                            // Trade Analytics
-                            if !api.historicalOrders.isEmpty || !api.trades.isEmpty {
-                                TradeAnalyticsView(historicalOrders: api.historicalOrders, trades: api.trades)
-                            }
-
-                            // Positions Table
-                            PositionsTableView(positions: api.positions)
-
-                            // Trades Today
-                            TradesView(trades: api.trades)
-                        }
-                    }
-                }
-
-                Spacer()
+                // Bottom Navigation Bar
+                BottomNavigationBar(selectedTab: $selectedTab)
             }
-            .padding(16)
             .navigationTitle("")
             .onAppear {
                 api.startRefreshTimer()
@@ -906,6 +934,70 @@ struct SettingsView: View {
         }
         .padding(16)
         .frame(width: 380)
+    }
+}
+
+// MARK: - Bottom Navigation Bar
+
+struct BottomNavigationBar: View {
+    @Binding var selectedTab: ContentView.TabType
+
+    var body: some View {
+        HStack(spacing: 0) {
+            TabBarItem(
+                icon: "chart.line.uptrend.xyaxis",
+                label: "P&L",
+                isSelected: selectedTab == .pnl,
+                action: { selectedTab = .pnl }
+            )
+
+            TabBarItem(
+                icon: "square.grid.2x2",
+                label: "Positions",
+                isSelected: selectedTab == .positions,
+                action: { selectedTab = .positions }
+            )
+
+            TabBarItem(
+                icon: "arrow.left.arrow.right",
+                label: "Trades",
+                isSelected: selectedTab == .trades,
+                action: { selectedTab = .trades }
+            )
+
+            TabBarItem(
+                icon: "gear",
+                label: "Settings",
+                isSelected: selectedTab == .settings,
+                action: { selectedTab = .settings }
+            )
+        }
+        .frame(height: 60)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.11))
+        .border(Color(red: 0.15, green: 0.25, blue: 0.55), width: 1)
+    }
+}
+
+struct TabBarItem: View {
+    let icon: String
+    let label: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                Text(label)
+                    .font(.caption2)
+            }
+            .frame(maxWidth: .infinity)
+            .foregroundColor(isSelected ? Color(red: 0.4, green: 0.6, blue: 1.0) : .gray)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
+        .background(isSelected ? Color(red: 0.12, green: 0.15, blue: 0.22) : Color.clear)
     }
 }
 
