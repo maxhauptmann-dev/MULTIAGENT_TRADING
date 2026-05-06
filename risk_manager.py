@@ -58,15 +58,15 @@ class RiskManager:
     """Manages Greeks calculation and enforces portfolio limits"""
 
     # Portfolio-level limits
-    MAX_PORTFOLIO_DELTA = 0.30  # Max ±30% delta exposure
+    MAX_PORTFOLIO_DELTA = 0.50  # Max ±50% delta exposure
     MAX_THETA_BLEED_DAY = 500.0  # Max $500/day theta decay
     MAX_CONCURRENT_POSITIONS = 5  # Max 5 open options positions
-    MIN_DTE = 14  # Minimum days-to-expiration
+    MIN_DTE = 7  # Minimum days-to-expiration
     MAX_NOTIONAL_PER_POSITION = 0.10  # Max 10% of account per position
 
-    # Position-level limits
-    MAX_DELTA_PER_POSITION = 0.20  # Max ±20% delta per position
-    MAX_GAMMA_PER_POSITION = 0.10  # Max 10% gamma per position
+    # Position-level limits — ATM directional calls/puts have delta ~0.5, spreads ~0.25-0.35
+    MAX_DELTA_PER_POSITION = 0.70  # Max ±70% delta per position (allows ATM calls/puts)
+    MAX_GAMMA_PER_POSITION = 0.50  # Max 50% gamma per position
 
     def __init__(self, account_size: float = 100000.0):
         self.account_size = account_size

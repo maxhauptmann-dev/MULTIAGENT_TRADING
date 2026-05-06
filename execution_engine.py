@@ -5,9 +5,11 @@ Uses Ask-Entry (worst-case) and Mid-Price Exit for realistic P&L.
 """
 
 import logging
+import os
 import sqlite3
 import json
-from datetime import datetime, timezone
+import requests
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
@@ -157,6 +159,9 @@ class ExecutionEngine:
 
         self.trades[trade_id] = trade
         self._save_trade_to_db(trade)
+
+        # Attempt live Alpaca order (non-blocking — falls back gracefully on failure)
+        self._submit_alpaca_option_order(signal, trade)
 
         self.logger.info(
             f"[EXECUTION] {signal.symbol} {signal.strategy.value} @ ${entry_price:.2f} "
@@ -338,6 +343,134 @@ class ExecutionEngine:
             vega=vega,
             price=entry_price
         )
+
+    def _submit_alpaca_option_order(self, signal: "Signal", trade: ExecutedTrade) -> None:
+        """
+        Submit option order(s) to Alpaca using the Contracts API to find real contracts.
+        Falls back to local-only on any error.
+        """
+        api_key = os.getenv("APCA_API_KEY_ID")
+        api_secret = os.getenv("APCA_API_SECRET_KEY")
+        base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+        if not (api_key and api_secret):
+            return
+
+        headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+            "Content-Type": "application/json",
+        }
+
+        # ── 1. Check options trading level ───────────────────────────────────
+        try:
+            acct = requests.get(f"{base_url}/v2/account", headers=headers, timeout=10)
+            acct.raise_for_status()
+            if int(acct.json().get("options_trading_level") or 0) == 0:
+                self.logger.warning("[Alpaca Options] Options Level 0 — not enabled.")
+                return
+        except Exception as e:
+            self.logger.warning(f"[Alpaca Options] Account check failed: {e}")
+            return
+
+        if not signal.legs:
+            return
+
+        contracts_qty = signal.recommended_contracts or 1
+        dte_target = signal.recommended_dte or 30
+
+        # Expiry window: dte_target ± 14 days
+        today = datetime.now(timezone.utc).date()
+        exp_min = (today + timedelta(days=max(dte_target - 14, 7))).isoformat()
+        exp_max = (today + timedelta(days=dte_target + 14)).isoformat()
+
+        # Sort: long legs first
+        sorted_legs = sorted(signal.legs, key=lambda l: 0 if l.side == "long" else 1)
+
+        for leg in sorted_legs:
+            try:
+                opt_type = "call" if leg.option_type.lower().startswith("c") else "put"
+                target_strike = leg.strike
+
+                # ── 2. Find real contract from Alpaca ────────────────────────
+                strike_lo = round(target_strike * 0.95, 2)
+                strike_hi = round(target_strike * 1.05, 2)
+                contracts_resp = requests.get(
+                    f"{base_url}/v2/options/contracts",
+                    headers=headers,
+                    params={
+                        "underlying_symbols": signal.symbol,
+                        "type": opt_type,
+                        "expiration_date_gte": exp_min,
+                        "expiration_date_lte": exp_max,
+                        "strike_price_gte": str(strike_lo),
+                        "strike_price_lte": str(strike_hi),
+                        "limit": "10",
+                    },
+                    timeout=10,
+                )
+                contracts_resp.raise_for_status()
+                available = contracts_resp.json().get("option_contracts", [])
+
+                if not available:
+                    self.logger.warning(
+                        f"[Alpaca Options] No {opt_type} contracts found for {signal.symbol} "
+                        f"strike≈${target_strike:.0f} exp {exp_min}→{exp_max} — saved locally."
+                    )
+                    continue
+
+                # Pick contract closest to target strike
+                best = min(available, key=lambda c: abs(float(c["strike_price"]) - target_strike))
+                occ_sym = best["symbol"]
+                actual_strike = float(best["strike_price"])
+
+                # ── 3. Get current price for limit order ─────────────────────
+                try:
+                    snap = requests.get(
+                        f"{base_url}/v2/options/contracts/{occ_sym}",
+                        headers=headers, timeout=5
+                    )
+                    snap_data = snap.json()
+                    close_price = float(snap_data.get("close_price") or snap_data.get("last_price") or 0)
+                except Exception:
+                    close_price = 0
+
+                # Estimate limit price: use close_price or fallback to theoretical
+                if close_price > 0:
+                    limit_price = round(close_price * 1.05, 2) if leg.side == "long" else round(close_price * 0.95, 2)
+                else:
+                    iv = signal.iv_percentile / 100.0 if signal.iv_percentile > 1 else 0.25
+                    limit_price = round(signal.current_price * iv * 0.1, 2)
+                    limit_price = max(limit_price, 0.05)
+
+                # ── 4. Place limit order ──────────────────────────────────────
+                order_side = "buy" if leg.side == "long" else "sell"
+                resp = requests.post(
+                    f"{base_url}/v2/orders",
+                    headers=headers,
+                    json={
+                        "symbol": occ_sym,
+                        "qty": str(contracts_qty * leg.quantity),
+                        "side": order_side,
+                        "type": "limit",
+                        "limit_price": str(limit_price),
+                        "time_in_force": "day",
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                order_data = resp.json()
+                self.logger.info(
+                    f"[Alpaca Options] ✓ Order placed: {occ_sym} ({opt_type} strike=${actual_strike}) "
+                    f"{order_side} x{contracts_qty} @ limit ${limit_price} "
+                    f"→ id={order_data.get('id')} status={order_data.get('status')}"
+                )
+
+            except requests.HTTPError as e:
+                body = e.response.text[:200] if e.response else "no response"
+                self.logger.error(f"[Alpaca Options] HTTP {e.response.status_code if e.response else '?'} for {signal.symbol} {leg.option_type}: {body} — saved locally.")
+            except Exception as e:
+                self.logger.error(f"[Alpaca Options] Error for {signal.symbol} {leg.option_type}: {e} — saved locally.")
 
 
 # ============================================================

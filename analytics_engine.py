@@ -489,19 +489,19 @@ class AnalyticsEngine:
         hv = daily_ind.atr_pct / 100 if daily_ind.atr_pct else 0.25
 
         # IV Rank (simplified: percentile assumption)
-        # In production, compare to 252-day IV history
+        # Tech stocks: 20% = low, 25% = medium, 35%+ = high
         if iv < 0.15:
-            iv_percentile = 20.0
+            iv_percentile = 15.0   # very low
         elif iv < 0.20:
-            iv_percentile = 35.0
-        elif iv < 0.25:
-            iv_percentile = 50.0
-        elif iv < 0.35:
-            iv_percentile = 70.0
-        elif iv < 0.50:
-            iv_percentile = 85.0
+            iv_percentile = 30.0   # low
+        elif iv <= 0.25:
+            iv_percentile = 45.0   # medium (default fallback = 0.25 → 45%)
+        elif iv < 0.32:
+            iv_percentile = 60.0   # elevated
+        elif iv < 0.45:
+            iv_percentile = 75.0   # high
         else:
-            iv_percentile = 95.0
+            iv_percentile = 90.0   # extreme
 
         # Regime classification
         if iv < 0.15:

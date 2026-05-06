@@ -44,6 +44,7 @@ class Signal:
     confidence: float  # 0.0-1.0
     signal_strength: float  # 0.0-1.0 (based on technical score)
     entry_reason: str  # Human-readable explanation
+    current_price: float = 0.0  # Required for Greeks calculation
     legs: List[SignalLeg] = field(default_factory=list)
     recommended_contracts: int = 1
     recommended_dte: int = 30
@@ -66,6 +67,7 @@ class Signal:
             "confidence": self.confidence,
             "signal_strength": self.signal_strength,
             "entry_reason": self.entry_reason,
+            "current_price": self.current_price,
             "legs": [
                 {
                     "option_type": leg.option_type,
@@ -257,44 +259,36 @@ class StrategyEngine:
         daily_trend = analysis.trend_analysis.daily_trend
         iv_percentile = analysis.volatility_regime.iv_percentile
 
-        # Condition 1: Bullish + Bullish + Low IV
-        if (hourly_trend == Trend.BULLISH and
-            daily_trend == Trend.BULLISH and
-            iv_percentile < 40):
-            return StrategyType.BULL_CALL_SPREAD
+        # BULLISH + BULLISH — both timeframes confirm uptrend
+        if hourly_trend == Trend.BULLISH and daily_trend == Trend.BULLISH:
+            # High IV: sell put spread (collect premium, profit if stock holds/rises)
+            if iv_percentile >= 60:
+                return StrategyType.BEAR_PUT_SPREAD  # short put spread = income on bullish stock
+            else:
+                return StrategyType.BULL_CALL_SPREAD  # buy call spread = directional upside
 
-        # Condition 2: Bullish + Bullish + High IV
-        if (hourly_trend == Trend.BULLISH and
-            daily_trend == Trend.BULLISH and
-            iv_percentile > 60):
-            return StrategyType.BEAR_PUT_SPREAD
+        # BEARISH + BEARISH — both timeframes confirm downtrend
+        if hourly_trend == Trend.BEARISH and daily_trend == Trend.BEARISH:
+            return StrategyType.DIRECTIONAL_PUT  # buy puts for downside
 
-        # Condition 3: Neutral + Bullish + High IV
-        if (hourly_trend == Trend.NEUTRAL and
-            daily_trend == Trend.BULLISH and
-            iv_percentile > 60):
-            return StrategyType.BEAR_PUT_SPREAD
+        # BULLISH hourly + NEUTRAL daily — short-term momentum, no daily confirmation
+        if hourly_trend == Trend.BULLISH and daily_trend == Trend.NEUTRAL:
+            return StrategyType.DIRECTIONAL_CALL  # quick directional bet
 
-        # Condition 4: Neutral + Bullish + Low IV
-        if (hourly_trend == Trend.NEUTRAL and
-            daily_trend == Trend.BULLISH and
-            iv_percentile < 30):
-            return StrategyType.CALENDAR_SPREAD
-
-        # Condition 5: Bearish + Bullish (rare, hedge)
-        if (hourly_trend == Trend.BEARISH and
-            daily_trend == Trend.BULLISH):
-            return StrategyType.PROTECTIVE_PUT
-
-        # Condition 6: Bullish + Neutral
-        if (hourly_trend == Trend.BULLISH and
-            daily_trend == Trend.NEUTRAL):
-            return StrategyType.DIRECTIONAL_CALL
-
-        # Condition 7: Bearish + Bearish
-        if (hourly_trend == Trend.BEARISH and
-            daily_trend == Trend.BEARISH):
+        # BEARISH hourly + NEUTRAL daily
+        if hourly_trend == Trend.BEARISH and daily_trend == Trend.NEUTRAL:
             return StrategyType.DIRECTIONAL_PUT
+
+        # NEUTRAL hourly + BULLISH daily — range-bound short-term, bullish longer term
+        if hourly_trend == Trend.NEUTRAL and daily_trend == Trend.BULLISH:
+            if iv_percentile >= 55:
+                return StrategyType.BEAR_PUT_SPREAD  # sell put spread, collect premium
+            else:
+                return StrategyType.CALENDAR_SPREAD  # time-based in low-vol environment
+
+        # BEARISH hourly + BULLISH daily — short-term dip in uptrend → hedge
+        if hourly_trend == Trend.BEARISH and daily_trend == Trend.BULLISH:
+            return StrategyType.PROTECTIVE_PUT
 
         return None
 
@@ -314,6 +308,7 @@ class StrategyEngine:
             direction="neutral",  # Will be overridden
             confidence=0.5,  # Will be overridden
             entry_reason="",  # Will be overridden
+            current_price=analysis.current_price,  # Required for Greeks calculation
             signal_strength=signal_strength,
             iv_percentile=analysis.volatility_regime.iv_percentile,
             volatility_regime=analysis.volatility_regime.regime,

@@ -216,11 +216,18 @@ class PositionMonitor:
                 side = "long" if float(pos.get("qty", 0)) > 0 else "short"
                 entry_price = float(pos.get("avg_entry_price", 0))
 
-                # Prüfe ob Position schon in DB ist
+                # Prüfe ob Position schon in DB ist (match direction too — long/short can coexist)
                 exists = conn.execute(
-                    "SELECT id FROM positions WHERE symbol=? AND status=?",
-                    (symbol, "open")
+                    "SELECT id FROM positions WHERE symbol=? AND direction=? AND status=?",
+                    (symbol, side, "open")
                 ).fetchone()
+
+                # Close any stale open positions for this symbol with the WRONG direction
+                # (e.g. local DB has Long but Alpaca now shows Short)
+                conn.execute(
+                    "UPDATE positions SET status='closed' WHERE symbol=? AND direction!=? AND status='open' AND broker='alpaca'",
+                    (symbol, side)
+                )
 
                 if not exists:
                     conn.execute("""
@@ -230,6 +237,7 @@ class PositionMonitor:
                     """, (symbol, side, entry_price, qty,
                           datetime.utcnow().isoformat()))
                     synced += 1
+                    logger.info(f"[Alpaca Sync] New {side} position: {symbol} @ {entry_price} qty={qty}")
 
             conn.commit()
 

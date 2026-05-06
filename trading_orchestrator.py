@@ -5,6 +5,8 @@ Orchestrates all modules: DataFetcher → AnalyticsEngine → StrategyEngine →
 
 import logging
 import json
+import os
+import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
@@ -68,6 +70,15 @@ class TradingOrchestrator:
         if SCHEDULER_AVAILABLE and schedule_enabled:
             self._init_scheduler()
 
+        # Alpaca credentials for stop-loss monitoring
+        self._alpaca_key = os.getenv("APCA_API_KEY_ID", "")
+        self._alpaca_secret = os.getenv("APCA_API_SECRET_KEY", "")
+        self._alpaca_base = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        self._alpaca_headers = {
+            "APCA-API-KEY-ID": self._alpaca_key,
+            "APCA-API-SECRET-KEY": self._alpaca_secret,
+        }
+
         self.logger.info(
             f"TradingOrchestrator initialized: {len(symbols)} symbols, "
             f"${account_size:.0f} account"
@@ -115,6 +126,11 @@ class TradingOrchestrator:
         self.cycle_count += 1
         cycle_id = f"cycle_{self.cycle_count}_{datetime.now(timezone.utc).isoformat()}"
 
+        # Step 0: Check stop-losses on ALL Alpaca positions (incl. manually opened)
+        stopped = self.check_alpaca_stop_losses(hard_stop_pct=0.05)
+        if stopped:
+            self.logger.warning(f"[{cycle_id}] Stop-loss closed {len(stopped)} positions: {[s['symbol'] for s in stopped]}")
+
         result = CycleResult(
             cycle_id=cycle_id,
             timestamp=datetime.now(timezone.utc),
@@ -152,10 +168,17 @@ class TradingOrchestrator:
                         result.errors.append(f"{symbol}: Insufficient candles")
                         continue
 
+                    # Get current price: use API if available, fallback to last hourly close
+                    if data["price"]:
+                        current_price = data["price"]["price"]
+                    else:
+                        # Fallback: use last hourly candle close price
+                        current_price = data["hourly_candles"][-1].close if data["hourly_candles"] else 100.0
+
                     # Analyze
                     analysis = self.analytics_engine.analyze(
                         symbol=symbol,
-                        current_price=data["price"]["price"] if data["price"] else 0.0,
+                        current_price=current_price,
                         hourly_candles=data["hourly_candles"],
                         daily_candles=data["daily_candles"],
                         iv=data["iv"],
@@ -307,38 +330,126 @@ class TradingOrchestrator:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+    def check_alpaca_stop_losses(self, hard_stop_pct: float = 0.05) -> List[Dict]:
+        """
+        Fetch all open Alpaca positions and close any that exceed the stop-loss.
+        Runs every cycle so existing positions (incl. manually opened) are protected.
+        """
+        closed = []
+        try:
+            resp = requests.get(
+                f"{self._alpaca_base}/v2/positions",
+                headers=self._alpaca_headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                self.logger.warning(f"[StopLoss] Could not fetch positions: {resp.status_code}")
+                return closed
+
+            positions = resp.json()
+        except Exception as e:
+            self.logger.warning(f"[StopLoss] Fetch error: {e}")
+            return closed
+
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            qty = float(pos.get("qty", 0))
+            side = pos.get("side", "long")  # "long" or "short"
+            avg_entry = float(pos.get("avg_entry_price", 0))
+            current_price = float(pos.get("current_price", 0))
+            unrealized_plpc = float(pos.get("unrealized_plpc", 0))  # already as fraction
+
+            if avg_entry <= 0 or current_price <= 0:
+                continue
+
+            # Calculate loss % (positive = loss)
+            if side == "long":
+                loss_pct = (avg_entry - current_price) / avg_entry
+            else:  # short
+                loss_pct = (current_price - avg_entry) / avg_entry
+
+            if loss_pct < hard_stop_pct:
+                continue
+
+            self.logger.warning(
+                f"[StopLoss] {symbol} {side} — loss {loss_pct*100:.1f}% > {hard_stop_pct*100:.0f}% threshold → CLOSING"
+            )
+
+            # Place market order to close
+            close_side = "sell" if side == "long" else "buy"
+            close_qty = abs(qty)
+            try:
+                order_resp = requests.post(
+                    f"{self._alpaca_base}/v2/orders",
+                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
+                    json={
+                        "symbol": symbol,
+                        "qty": str(int(close_qty)),
+                        "side": close_side,
+                        "type": "market",
+                        "time_in_force": "day",
+                    },
+                    timeout=10,
+                )
+                if order_resp.status_code in (200, 201):
+                    self.logger.warning(
+                        f"[StopLoss] ✓ {symbol} close order placed (loss={loss_pct*100:.1f}%)"
+                    )
+                    closed.append({"symbol": symbol, "side": side, "loss_pct": loss_pct})
+                else:
+                    self.logger.error(
+                        f"[StopLoss] ✗ {symbol} close order failed: {order_resp.status_code} {order_resp.text[:100]}"
+                    )
+            except Exception as e:
+                self.logger.error(f"[StopLoss] ✗ {symbol} close order error: {e}")
+
+        return closed
+
 
 # ============================================================
 # Test
 # ============================================================
 
 if __name__ == "__main__":
+    import time as _time
     logging.basicConfig(level=logging.INFO)
 
-    # Test orchestrator with small watchlist
+    # Expanded watchlist — diverse sectors for more signal opportunities
+    SYMBOLS = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",  # Tech
+        "META", "TSLA",                              # Growth
+        "AMD", "INTC",                               # Semiconductors
+        "JPM", "GS",                                 # Finance
+        "SPY", "QQQ",                                # ETFs
+    ]
+
     orchestrator = TradingOrchestrator(
-        symbols=["AAPL", "MSFT"],
+        symbols=SYMBOLS,
         account_size=100000.0,
-        schedule_enabled=False,  # Don't start scheduler in test
+        schedule_enabled=True,  # Run hourly via APScheduler
     )
 
-    print("\n=== Running Single Cycle ===")
-    result = orchestrator.run_hourly_cycle()
+    orchestrator.start()
 
+    # Run first cycle immediately on startup
+    print("\n=== Running Initial Cycle ===")
+    result = orchestrator.run_hourly_cycle()
     if result:
-        print("\n=== Cycle Result ===")
         import json
-        result_dict = {
+        print(json.dumps({
             "cycle_id": result.cycle_id,
             "symbols_analyzed": result.symbols_analyzed,
             "signals_generated": result.signals_generated,
             "signals_executed": result.signals_executed,
             "signals_rejected": result.signals_rejected,
-            "duration_seconds": result.duration_seconds,
+            "duration_seconds": round(result.duration_seconds, 1),
             "errors": result.errors,
-        }
-        print(json.dumps(result_dict, indent=2, default=str))
+        }, indent=2, default=str))
 
-    print("\n=== Portfolio Status ===")
-    status = orchestrator.get_portfolio_status()
-    print(json.dumps(status, indent=2, default=str))
+    print("\n=== Scheduler running (hourly cycles) — Ctrl+C to stop ===")
+    try:
+        while True:
+            _time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        orchestrator.stop()
+        print("Orchestrator stopped.")
