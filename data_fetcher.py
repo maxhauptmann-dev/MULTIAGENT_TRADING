@@ -310,47 +310,81 @@ class DataFetcher:
         self,
         symbol: str,
         retry_count: int = 3,
-    ) -> Optional[float]:
-        """Fetch implied volatility for symbol (cached 1 hour)"""
+    ) -> float:
+        """
+        Fetch implied volatility for symbol (cached 1 hour).
+
+        Primary:  Alpaca options snapshot (works on live accounts).
+        Fallback: 30-day Historical Volatility (HV30) from yfinance price history.
+                  HV30 is a reliable IV proxy — NVDA ~45%, AAPL ~25%, SPY ~12%.
+        """
         cache_key = f"iv:{symbol}"
-        cached = self.cache.get(cache_key, ttl_seconds=3600)  # 1-hour cache
+        cached = self.cache.get(cache_key, ttl_seconds=3600)
         if cached is not None:
             return cached
 
+        # 1. Try Alpaca options snapshot
         url = f"{self.BASE_URL}/v1/marketdata/etfs/{symbol}/snapshot"
-
         for attempt in range(retry_count):
             try:
-                response = requests.get(
-                    url,
-                    headers=self.headers,
-                    timeout=10,
-                )
+                response = requests.get(url, headers=self.headers, timeout=10)
                 response.raise_for_status()
                 data = response.json()
-
-                # Extract IV from option chain if available
                 if "option_chain" in data:
-                    iv = data["option_chain"].get("iv", 0.25)
-                else:
-                    # Fallback: use previous or default
-                    iv = 0.25
+                    iv = float(data["option_chain"].get("iv", 0) or 0)
+                    if iv > 0:
+                        self.cache.set(cache_key, iv)
+                        self.logger.info(f"[IV] {symbol} from Alpaca: {iv:.4f}")
+                        return iv
+                break  # Got a response but no IV — skip retries
+            except requests.exceptions.RequestException:
+                break  # 404 or network error — go straight to fallback
 
-                self.cache.set(cache_key, iv)
-                self.logger.info(f"Fetched IV for {symbol}: {iv:.4f}")
-                return iv
+        # 2. Fallback: HV30 from yfinance price history
+        iv = self._fetch_hv30_yfinance(symbol)
+        self.cache.set(cache_key, iv)
+        return iv
 
-            except requests.exceptions.RequestException as e:
-                self.logger.warning(
-                    f"Attempt {attempt + 1}/{retry_count}: Failed to fetch IV "
-                    f"for {symbol}: {e}"
-                )
-                if attempt < retry_count - 1:
-                    time.sleep(1 + attempt)
-                continue
+    def _fetch_hv30_yfinance(self, symbol: str) -> float:
+        """
+        Calculate 30-day historical volatility (HV30) as IV proxy.
+        Uses 1-year daily price history from yfinance.
+        HV30 = annualised std-dev of daily log returns over last 30 days.
+        This is stock-specific: SPY ~0.12, AAPL ~0.25, NVDA ~0.45, TSLA ~0.60.
+        """
+        try:
+            import yfinance as yf
+            import math
 
-        self.logger.warning(f"Failed to fetch IV for {symbol}, using default 0.25")
-        return 0.25
+            hist = yf.Ticker(symbol).history(period="1y", interval="1d", auto_adjust=True)
+            if hist.empty or len(hist) < 31:
+                self.logger.warning(f"[IV] yfinance: insufficient history for {symbol}")
+                return 0.25
+
+            closes = [float(c) for c in hist["Close"].values]
+            log_returns = [
+                math.log(closes[i] / closes[i - 1])
+                for i in range(1, len(closes))
+                if closes[i - 1] > 0
+            ]
+
+            if len(log_returns) < 30:
+                return 0.25
+
+            last30 = log_returns[-30:]
+            mean = sum(last30) / len(last30)
+            variance = sum((r - mean) ** 2 for r in last30) / (len(last30) - 1)
+            hv30 = variance ** 0.5 * (252 ** 0.5)
+
+            # Sanity bounds: 5% – 200%
+            hv30 = max(0.05, min(hv30, 2.0))
+
+            self.logger.info(f"[IV] {symbol} HV30 from yfinance: {hv30:.4f}")
+            return hv30
+
+        except Exception as e:
+            self.logger.warning(f"[IV] yfinance HV30 failed for {symbol}: {e}")
+            return 0.25
 
     # -------- Current Market Price --------
     def fetch_current_price(
