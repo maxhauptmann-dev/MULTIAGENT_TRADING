@@ -126,10 +126,15 @@ class TradingOrchestrator:
         self.cycle_count += 1
         cycle_id = f"cycle_{self.cycle_count}_{datetime.now(timezone.utc).isoformat()}"
 
-        # Step 0: Check stop-losses on ALL Alpaca positions (incl. manually opened)
+        # Step 0a: Check stop-losses on ALL Alpaca positions (incl. manually opened)
         stopped = self.check_alpaca_stop_losses(hard_stop_pct=0.05)
         if stopped:
             self.logger.warning(f"[{cycle_id}] Stop-loss closed {len(stopped)} positions: {[s['symbol'] for s in stopped]}")
+
+        # Step 0b: Close option positions that conflict with current signal direction
+        reconciled = self.reconcile_option_positions()
+        if reconciled:
+            self.logger.warning(f"[{cycle_id}] Reconciled {len(reconciled)} conflicting options: {[r['symbol'] for r in reconciled]}")
 
         result = CycleResult(
             cycle_id=cycle_id,
@@ -405,6 +410,118 @@ class TradingOrchestrator:
 
         return closed
 
+    def reconcile_option_positions(self) -> List[Dict]:
+        """
+        Close option positions whose direction conflicts with current signal.
+        Catches positions opened under stale/buggy strategy logic.
+        Long Put on bullish stock → close. Long Call on bearish stock → close.
+        """
+        import re
+        closed = []
+        occ_pattern = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
+
+        try:
+            resp = requests.get(
+                f"{self._alpaca_base}/v2/positions",
+                headers=self._alpaca_headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return closed
+            positions = resp.json()
+        except Exception as e:
+            self.logger.warning(f"[Reconcile] Fetch error: {e}")
+            return closed
+
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            match = occ_pattern.match(symbol)
+            if not match:
+                continue  # Not an option
+
+            underlying = match.group(1)
+            opt_type = match.group(3)  # P or C
+            qty = float(pos.get("qty", 0))
+            current_price = float(pos.get("current_price", 0))
+            unrealized_plpc = float(pos.get("unrealized_plpc", 0))
+
+            if underlying not in self.symbols:
+                continue
+
+            try:
+                data = self.data_fetcher.fetch_all_symbols([underlying]).get(underlying)
+                if not data or not data.get("hourly_candles") or not data.get("daily_candles"):
+                    continue
+
+                price = data["price"]["price"] if data.get("price") else data["hourly_candles"][-1].close
+                analysis = self.analytics_engine.analyze(
+                    symbol=underlying,
+                    current_price=price,
+                    hourly_candles=data["hourly_candles"],
+                    daily_candles=data["daily_candles"],
+                    iv=data["iv"],
+                )
+                if not analysis:
+                    continue
+
+                signal = self.strategy_engine.generate_signal(analysis)
+                if not signal:
+                    continue
+
+                direction = signal.direction  # "bullish" or "bearish"
+
+                # Conflict: long put on bullish signal, or long call on bearish signal
+                is_conflict = (opt_type == "P" and direction == "bullish") or \
+                              (opt_type == "C" and direction == "bearish")
+
+                if not is_conflict:
+                    continue
+
+                self.logger.warning(
+                    f"[Reconcile] {symbol} ({opt_type}) conflicts with {direction} signal "
+                    f"(P&L: {unrealized_plpc*100:.1f}%) → CLOSING"
+                )
+
+                # Limit order at 98% of current price (willing to accept small discount to exit quickly)
+                limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
+                order_body: Dict = {
+                    "symbol": symbol,
+                    "qty": str(int(abs(qty))),
+                    "side": "sell",
+                    "type": "limit" if limit_price else "market",
+                    "time_in_force": "day",
+                }
+                if limit_price:
+                    order_body["limit_price"] = str(limit_price)
+
+                order_resp = requests.post(
+                    f"{self._alpaca_base}/v2/orders",
+                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
+                    json=order_body,
+                    timeout=10,
+                )
+                if order_resp.status_code in (200, 201):
+                    self.logger.info(
+                        f"[Reconcile] ✓ {symbol} close order placed @ ${limit_price}"
+                    )
+                    closed.append({
+                        "symbol": symbol,
+                        "underlying": underlying,
+                        "opt_type": opt_type,
+                        "direction": direction,
+                        "pnl_pct": round(unrealized_plpc * 100, 2),
+                    })
+                else:
+                    self.logger.error(
+                        f"[Reconcile] ✗ {symbol} close failed: {order_resp.status_code} {order_resp.text[:120]}"
+                    )
+
+            except Exception as e:
+                self.logger.error(f"[Reconcile] Error processing {underlying}: {e}")
+                continue
+
+        return closed
+
 
 # ============================================================
 # Test
@@ -430,6 +547,15 @@ if __name__ == "__main__":
     )
 
     orchestrator.start()
+
+    # Immediately reconcile conflicting positions from previous (buggy) cycles
+    print("\n=== Reconciling Conflicting Option Positions ===")
+    reconciled = orchestrator.reconcile_option_positions()
+    if reconciled:
+        import json as _json
+        print(_json.dumps(reconciled, indent=2))
+    else:
+        print("No conflicting positions found.")
 
     # Run first cycle immediately on startup
     print("\n=== Running Initial Cycle ===")
