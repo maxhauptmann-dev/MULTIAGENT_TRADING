@@ -418,14 +418,54 @@ class TradingOrchestrator:
 
         return closed
 
+    def _cancel_all_open_orders(self) -> None:
+        """Cancel all open orders to free options_buying_power before closing positions.
+        Alpaca paper trading treats pending sell orders as new shorts, consuming buying power."""
+        try:
+            r = requests.delete(
+                f"{self._alpaca_base}/v2/orders",
+                headers=self._alpaca_headers, timeout=10,
+            )
+            self.logger.info(f"[Orders] Cancelled all open orders: HTTP {r.status_code}")
+        except Exception as e:
+            self.logger.warning(f"[Orders] Cancel error: {e}")
+
+    def _close_option_position(self, symbol: str, unrealized_plpc: float, label: str) -> bool:
+        """Close a single option position via DELETE /v2/positions/{symbol}."""
+        try:
+            r = requests.delete(
+                f"{self._alpaca_base}/v2/positions/{symbol}",
+                headers=self._alpaca_headers, timeout=10,
+            )
+            if r.status_code in (200, 201):
+                self.logger.warning(
+                    f"[{label}] ✓ {symbol} closed (P&L: {unrealized_plpc*100:.1f}%)"
+                )
+                return True
+            self.logger.error(f"[{label}] ✗ {symbol}: {r.status_code} {r.text[:100]}")
+        except Exception as e:
+            self.logger.error(f"[{label}] ✗ {symbol}: {e}")
+        return False
+
     def close_all_option_positions(self) -> List[Dict]:
         """
-        Immediately close ALL open option positions via limit orders at 98% of current price.
-        Used for cleanup after strategy bugs or manual resets.
+        Close ALL open option positions using DELETE /v2/positions/{symbol}.
+        Cancels all open orders first to free up options_buying_power (Alpaca paper
+        trading bug: pending sell orders consume buying power as if opening new shorts).
         """
         import re
         closed = []
         occ_pattern = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
+
+        # Cancel all open orders first — frees options_buying_power
+        try:
+            cr = requests.delete(
+                f"{self._alpaca_base}/v2/orders",
+                headers=self._alpaca_headers, timeout=10,
+            )
+            self.logger.info(f"[CloseAll] Cancelled all open orders: {cr.status_code}")
+        except Exception as e:
+            self.logger.warning(f"[CloseAll] Cancel orders error: {e}")
 
         try:
             resp = requests.get(
@@ -444,30 +484,17 @@ class TradingOrchestrator:
             symbol = pos.get("symbol", "")
             if not occ_pattern.match(symbol):
                 continue
-            qty = float(pos.get("qty", 0))
-            current_price = float(pos.get("current_price", 0))
             unrealized_plpc = float(pos.get("unrealized_plpc", 0))
 
-            limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
-            order_body: Dict = {
-                "symbol": symbol,
-                "qty": str(int(abs(qty))),
-                "side": "sell",
-                "type": "limit" if limit_price else "market",
-                "time_in_force": "day",
-            }
-            if limit_price:
-                order_body["limit_price"] = str(limit_price)
-
+            # Use DELETE /v2/positions/{symbol} — Alpaca handles close internally
             try:
-                r = requests.post(
-                    f"{self._alpaca_base}/v2/orders",
-                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
-                    json=order_body, timeout=10,
+                r = requests.delete(
+                    f"{self._alpaca_base}/v2/positions/{symbol}",
+                    headers=self._alpaca_headers, timeout=10,
                 )
                 if r.status_code in (200, 201):
                     self.logger.warning(
-                        f"[CloseAll] ✓ {symbol} close order @ ${limit_price} "
+                        f"[CloseAll] ✓ {symbol} closed "
                         f"(P&L: {unrealized_plpc*100:.1f}%)"
                     )
                     closed.append({"symbol": symbol, "pnl_pct": round(unrealized_plpc * 100, 2)})
@@ -560,40 +587,15 @@ class TradingOrchestrator:
                 continue
 
             self.logger.warning(f"[OptionExit] {symbol} → {exit_reason}")
-
-            limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
-            order_body: Dict = {
-                "symbol": symbol,
-                "qty": str(int(abs(qty))),
-                "side": "sell",
-                "type": "limit" if limit_price else "market",
-                "time_in_force": "day",
-            }
-            if limit_price:
-                order_body["limit_price"] = str(limit_price)
-
-            try:
-                order_resp = requests.post(
-                    f"{self._alpaca_base}/v2/orders",
-                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
-                    json=order_body,
-                    timeout=10,
-                )
-                if order_resp.status_code in (200, 201):
-                    self.logger.info(f"[OptionExit] ✓ {symbol} closed — {exit_reason}")
-                    closed.append({
-                        "symbol": symbol,
-                        "reason": exit_reason,
-                        "pnl_pct": round(unrealized_plpc * 100, 2),
-                        "hwm_pct": round(hwm * 100, 2),
-                    })
-                    self._option_hwm.pop(symbol, None)
-                else:
-                    self.logger.error(
-                        f"[OptionExit] ✗ {symbol}: {order_resp.status_code} {order_resp.text[:120]}"
-                    )
-            except Exception as e:
-                self.logger.error(f"[OptionExit] ✗ {symbol}: {e}")
+            self._cancel_all_open_orders()
+            if self._close_option_position(symbol, unrealized_plpc, "OptionExit"):
+                closed.append({
+                    "symbol": symbol,
+                    "reason": exit_reason,
+                    "pnl_pct": round(unrealized_plpc * 100, 2),
+                    "hwm_pct": round(hwm * 100, 2),
+                })
+                self._option_hwm.pop(symbol, None)
 
         return closed
 
@@ -668,29 +670,8 @@ class TradingOrchestrator:
                     f"[Reconcile] {symbol} ({opt_type}) conflicts with {direction} signal "
                     f"(P&L: {unrealized_plpc*100:.1f}%) → CLOSING"
                 )
-
-                # Limit order at 98% of current price (willing to accept small discount to exit quickly)
-                limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
-                order_body: Dict = {
-                    "symbol": symbol,
-                    "qty": str(int(abs(qty))),
-                    "side": "sell",
-                    "type": "limit" if limit_price else "market",
-                    "time_in_force": "day",
-                }
-                if limit_price:
-                    order_body["limit_price"] = str(limit_price)
-
-                order_resp = requests.post(
-                    f"{self._alpaca_base}/v2/orders",
-                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
-                    json=order_body,
-                    timeout=10,
-                )
-                if order_resp.status_code in (200, 201):
-                    self.logger.info(
-                        f"[Reconcile] ✓ {symbol} close order placed @ ${limit_price}"
-                    )
+                self._cancel_all_open_orders()
+                if self._close_option_position(symbol, unrealized_plpc, "Reconcile"):
                     closed.append({
                         "symbol": symbol,
                         "underlying": underlying,
@@ -698,10 +679,6 @@ class TradingOrchestrator:
                         "direction": direction,
                         "pnl_pct": round(unrealized_plpc * 100, 2),
                     })
-                else:
-                    self.logger.error(
-                        f"[Reconcile] ✗ {symbol} close failed: {order_resp.status_code} {order_resp.text[:120]}"
-                    )
 
             except Exception as e:
                 self.logger.error(f"[Reconcile] Error processing {underlying}: {e}")
