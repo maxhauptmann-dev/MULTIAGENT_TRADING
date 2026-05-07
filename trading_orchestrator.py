@@ -65,6 +65,9 @@ class TradingOrchestrator:
         self.cycle_count = 0
         self.last_cycle_result: Optional[CycleResult] = None
 
+        # Option exit tracking: OCC symbol → max unrealized_plpc seen (high-water mark)
+        self._option_hwm: Dict[str, float] = {}
+
         # Scheduler
         self.scheduler = None
         if SCHEDULER_AVAILABLE and schedule_enabled:
@@ -135,6 +138,11 @@ class TradingOrchestrator:
         reconciled = self.reconcile_option_positions()
         if reconciled:
             self.logger.warning(f"[{cycle_id}] Reconciled {len(reconciled)} conflicting options: {[r['symbol'] for r in reconciled]}")
+
+        # Step 0c: Option stop-loss + profit-lock exits
+        exited = self.check_option_exits()
+        if exited:
+            self.logger.warning(f"[{cycle_id}] Option exits: {[e['symbol'] + ' ' + e['reason'] for e in exited]}")
 
         result = CycleResult(
             cycle_id=cycle_id,
@@ -407,6 +415,125 @@ class TradingOrchestrator:
                     )
             except Exception as e:
                 self.logger.error(f"[StopLoss] ✗ {symbol} close order error: {e}")
+
+        return closed
+
+    def check_option_exits(self) -> List[Dict]:
+        """
+        Manages option exits via hard stop-loss and profit-locking tiers.
+
+        Hard stop-loss:  option loses > 35% of entry price → close immediately.
+        Profit-locking:  tracks high-water mark (HWM) per position.
+                         Once HWM crosses a tier, a floor is set.
+                         If P&L drops below the floor → close to lock in gains.
+
+        Profit tiers (unrealized_plpc, i.e. 0.40 = +40%):
+            HWM ≥ +150% → floor +100%
+            HWM ≥ +100% → floor  +75%
+            HWM ≥  +80% → floor  +60%
+            HWM ≥  +60% → floor  +40%
+            HWM ≥  +40% → floor  +20%
+        """
+        import re
+
+        OPTION_STOP_LOSS = -0.35        # -35% on option premium
+        PROFIT_FLOORS = [
+            (1.50, 1.00),
+            (1.00, 0.75),
+            (0.80, 0.60),
+            (0.60, 0.40),
+            (0.40, 0.20),
+        ]
+
+        closed = []
+        occ_pattern = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
+
+        try:
+            resp = requests.get(
+                f"{self._alpaca_base}/v2/positions",
+                headers=self._alpaca_headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return closed
+            positions = resp.json()
+        except Exception as e:
+            self.logger.warning(f"[OptionExit] Fetch error: {e}")
+            return closed
+
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            if not occ_pattern.match(symbol):
+                continue
+
+            qty = float(pos.get("qty", 0))
+            current_price = float(pos.get("current_price", 0))
+            unrealized_plpc = float(pos.get("unrealized_plpc", 0))
+
+            # Update high-water mark
+            hwm = max(self._option_hwm.get(symbol, unrealized_plpc), unrealized_plpc)
+            self._option_hwm[symbol] = hwm
+
+            # Determine active profit floor from HWM
+            active_floor = None
+            for threshold, floor in PROFIT_FLOORS:
+                if hwm >= threshold:
+                    active_floor = floor
+                    break
+
+            # Evaluate exit conditions
+            exit_reason: Optional[str] = None
+
+            if unrealized_plpc <= OPTION_STOP_LOSS:
+                exit_reason = (
+                    f"stop-loss ({unrealized_plpc*100:.1f}% ≤ "
+                    f"-{abs(OPTION_STOP_LOSS)*100:.0f}%)"
+                )
+            elif active_floor is not None and unrealized_plpc < active_floor:
+                exit_reason = (
+                    f"profit-lock fell below floor "
+                    f"(HWM={hwm*100:.0f}% → floor={active_floor*100:.0f}%, "
+                    f"now={unrealized_plpc*100:.1f}%)"
+                )
+
+            if exit_reason is None:
+                continue
+
+            self.logger.warning(f"[OptionExit] {symbol} → {exit_reason}")
+
+            limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
+            order_body: Dict = {
+                "symbol": symbol,
+                "qty": str(int(abs(qty))),
+                "side": "sell",
+                "type": "limit" if limit_price else "market",
+                "time_in_force": "day",
+            }
+            if limit_price:
+                order_body["limit_price"] = str(limit_price)
+
+            try:
+                order_resp = requests.post(
+                    f"{self._alpaca_base}/v2/orders",
+                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
+                    json=order_body,
+                    timeout=10,
+                )
+                if order_resp.status_code in (200, 201):
+                    self.logger.info(f"[OptionExit] ✓ {symbol} closed — {exit_reason}")
+                    closed.append({
+                        "symbol": symbol,
+                        "reason": exit_reason,
+                        "pnl_pct": round(unrealized_plpc * 100, 2),
+                        "hwm_pct": round(hwm * 100, 2),
+                    })
+                    self._option_hwm.pop(symbol, None)
+                else:
+                    self.logger.error(
+                        f"[OptionExit] ✗ {symbol}: {order_resp.status_code} {order_resp.text[:120]}"
+                    )
+            except Exception as e:
+                self.logger.error(f"[OptionExit] ✗ {symbol}: {e}")
 
         return closed
 
