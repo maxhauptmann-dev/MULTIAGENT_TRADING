@@ -136,6 +136,10 @@ class StrategyEngine:
             # Build signal with strategy-specific details
             signal = self._build_signal(analysis, strategy, signal_strength)
 
+            # Quality gate: RSI + MACD + EMA must confirm direction
+            if not self._passes_quality_gate(signal, analysis):
+                return None
+
             self.logger.info(
                 f"{analysis.symbol}: {signal.strategy.value} "
                 f"({signal.direction}) confidence={signal.confidence:.2f}"
@@ -157,21 +161,18 @@ class StrategyEngine:
         scores = []
         weights = []
 
-        # Hourly RSI contribution
+        # Hourly RSI contribution — best score in healthy momentum zone (45-68),
+        # penalty for extremes (overbought >72 or oversold <28 = bad entry timing)
         if analysis.hourly_indicators.rsi_14 is not None:
             rsi = analysis.hourly_indicators.rsi_14
-            if rsi > 70:
-                rsi_score = 0.9
-            elif rsi > 60:
-                rsi_score = 0.75
-            elif rsi > 50:
-                rsi_score = 0.6
-            elif rsi > 40:
-                rsi_score = 0.4
-            elif rsi > 30:
-                rsi_score = 0.25
+            if 45 <= rsi <= 68:
+                rsi_score = 0.85   # sweet spot: momentum without overextension
+            elif 35 <= rsi < 45 or 68 < rsi <= 72:
+                rsi_score = 0.60   # acceptable
+            elif 28 <= rsi < 35 or 72 < rsi <= 80:
+                rsi_score = 0.35   # overextended, poor entry timing
             else:
-                rsi_score = 0.1
+                rsi_score = 0.15   # extreme (>80 overbought or <28 oversold)
             scores.append(rsi_score)
             weights.append(0.20)
 
@@ -236,6 +237,67 @@ class StrategyEngine:
 
         return score / (count + 1) if count > 0 else 0.5
 
+    def _passes_quality_gate(self, signal: Signal, analysis: Analysis) -> bool:
+        """
+        Multi-indicator confirmation gate. Requires RSI, MACD, and EMA
+        to agree with signal direction before allowing execution.
+
+        Bullish gate:  RSI 45-72, MACD histogram ≥ 0, EMA not bearish, price > EMA20
+        Bearish gate:  RSI 28-55, MACD histogram ≤ 0, EMA not bullish, price < EMA20
+        Income gate:   RSI 35-65 (neutral zone) — for premium-selling strategies
+        """
+        direction = signal.direction
+        rsi = analysis.hourly_indicators.rsi_14
+        macd_hist = analysis.hourly_indicators.macd_histogram
+        ema_20 = analysis.daily_indicators.ema_20
+        price = analysis.current_price
+        ema_align = analysis.daily_indicators.ema_alignment
+        h_strength = analysis.trend_analysis.hourly_strength
+        d_strength = analysis.trend_analysis.daily_strength
+        failures = []
+
+        # Both timeframes must have reasonable confidence
+        if h_strength is not None and h_strength < 0.52:
+            failures.append(f"hourly_strength={h_strength:.2f} too weak")
+        if d_strength is not None and d_strength < 0.52:
+            failures.append(f"daily_strength={d_strength:.2f} too weak")
+
+        if direction == "bullish":
+            if rsi is not None and rsi > 72:
+                failures.append(f"RSI={rsi:.1f} overbought (entry too late)")
+            if rsi is not None and rsi < 45:
+                failures.append(f"RSI={rsi:.1f} no bullish momentum")
+            if macd_hist is not None and macd_hist < 0:
+                failures.append(f"MACD histogram={macd_hist:.3f} bearish")
+            if ema_align == "bearish":
+                failures.append("EMA stack bearish — daily trend against trade")
+            if ema_20 is not None and price is not None and price < ema_20 * 0.98:
+                failures.append(f"price {price:.2f} below EMA20 {ema_20:.2f}")
+
+        elif direction == "bearish":
+            if rsi is not None and rsi < 28:
+                failures.append(f"RSI={rsi:.1f} oversold (entry too late)")
+            if rsi is not None and rsi > 55:
+                failures.append(f"RSI={rsi:.1f} no bearish momentum")
+            if macd_hist is not None and macd_hist > 0:
+                failures.append(f"MACD histogram={macd_hist:.3f} bullish")
+            if ema_align == "bullish":
+                failures.append("EMA stack bullish — daily trend against trade")
+            if ema_20 is not None and price is not None and price > ema_20 * 1.02:
+                failures.append(f"price {price:.2f} above EMA20 {ema_20:.2f}")
+
+        else:  # income / neutral strategies
+            if rsi is not None and (rsi > 70 or rsi < 30):
+                failures.append(f"RSI={rsi:.1f} too extreme for income strategy")
+
+        if failures:
+            self.logger.info(
+                f"{signal.symbol} quality gate blocked: {'; '.join(failures)}"
+            )
+            return False
+
+        return True
+
     # -------- Strategy Selection (Decision Tree) --------
 
     def _select_strategy(
@@ -271,13 +333,14 @@ class StrategyEngine:
         if hourly_trend == Trend.BEARISH and daily_trend == Trend.BEARISH:
             return StrategyType.DIRECTIONAL_PUT  # buy puts for downside
 
-        # BULLISH hourly + NEUTRAL daily — short-term momentum, no daily confirmation
+        # BULLISH hourly + NEUTRAL daily — no daily confirmation, skip
+        # (single-leg directional bets without daily trend = poor risk/reward)
         if hourly_trend == Trend.BULLISH and daily_trend == Trend.NEUTRAL:
-            return StrategyType.DIRECTIONAL_CALL  # quick directional bet
+            return None
 
-        # BEARISH hourly + NEUTRAL daily
+        # BEARISH hourly + NEUTRAL daily — no daily confirmation, skip
         if hourly_trend == Trend.BEARISH and daily_trend == Trend.NEUTRAL:
-            return StrategyType.DIRECTIONAL_PUT
+            return None
 
         # NEUTRAL hourly + BULLISH daily — range-bound short-term, bullish longer term
         if hourly_trend == Trend.NEUTRAL and daily_trend == Trend.BULLISH:

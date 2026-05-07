@@ -418,6 +418,66 @@ class TradingOrchestrator:
 
         return closed
 
+    def close_all_option_positions(self) -> List[Dict]:
+        """
+        Immediately close ALL open option positions via limit orders at 98% of current price.
+        Used for cleanup after strategy bugs or manual resets.
+        """
+        import re
+        closed = []
+        occ_pattern = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
+
+        try:
+            resp = requests.get(
+                f"{self._alpaca_base}/v2/positions",
+                headers=self._alpaca_headers, timeout=10,
+            )
+            if resp.status_code != 200:
+                self.logger.warning(f"[CloseAll] Could not fetch positions: {resp.status_code}")
+                return closed
+            positions = resp.json()
+        except Exception as e:
+            self.logger.warning(f"[CloseAll] Fetch error: {e}")
+            return closed
+
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            if not occ_pattern.match(symbol):
+                continue
+            qty = float(pos.get("qty", 0))
+            current_price = float(pos.get("current_price", 0))
+            unrealized_plpc = float(pos.get("unrealized_plpc", 0))
+
+            limit_price = round(current_price * 0.98, 2) if current_price > 0 else None
+            order_body: Dict = {
+                "symbol": symbol,
+                "qty": str(int(abs(qty))),
+                "side": "sell",
+                "type": "limit" if limit_price else "market",
+                "time_in_force": "day",
+            }
+            if limit_price:
+                order_body["limit_price"] = str(limit_price)
+
+            try:
+                r = requests.post(
+                    f"{self._alpaca_base}/v2/orders",
+                    headers={**self._alpaca_headers, "Content-Type": "application/json"},
+                    json=order_body, timeout=10,
+                )
+                if r.status_code in (200, 201):
+                    self.logger.warning(
+                        f"[CloseAll] ✓ {symbol} close order @ ${limit_price} "
+                        f"(P&L: {unrealized_plpc*100:.1f}%)"
+                    )
+                    closed.append({"symbol": symbol, "pnl_pct": round(unrealized_plpc * 100, 2)})
+                else:
+                    self.logger.error(f"[CloseAll] ✗ {symbol}: {r.status_code} {r.text[:100]}")
+            except Exception as e:
+                self.logger.error(f"[CloseAll] ✗ {symbol}: {e}")
+
+        return closed
+
     def check_option_exits(self) -> List[Dict]:
         """
         Manages option exits via hard stop-loss and profit-locking tiers.
@@ -436,7 +496,7 @@ class TradingOrchestrator:
         """
         import re
 
-        OPTION_STOP_LOSS = -0.35        # -35% on option premium
+        OPTION_STOP_LOSS = -0.20        # -20% on option premium (tighter)
         PROFIT_FLOORS = [
             (1.50, 1.00),
             (1.00, 0.75),
@@ -675,7 +735,16 @@ if __name__ == "__main__":
 
     orchestrator.start()
 
-    # Immediately reconcile conflicting positions from previous (buggy) cycles
+    # Close ALL open option positions (cleanup from bug-era)
+    print("\n=== Closing All Existing Option Positions ===")
+    all_closed = orchestrator.close_all_option_positions()
+    if all_closed:
+        import json as _json2
+        print(_json2.dumps(all_closed, indent=2))
+    else:
+        print("No open option positions found.")
+
+    # Reconcile any remaining conflicting positions
     print("\n=== Reconciling Conflicting Option Positions ===")
     reconciled = orchestrator.reconcile_option_positions()
     if reconciled:

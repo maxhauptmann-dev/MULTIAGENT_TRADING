@@ -117,7 +117,7 @@ class ExecutionEngine:
         """
 
         # Validate signal
-        if not signal or signal.confidence < 0.60:
+        if not signal or signal.confidence < 0.75:
             return ExecutionResult(
                 executed=False,
                 reason=f"Low confidence: {signal.confidence if signal else 'None'}"
